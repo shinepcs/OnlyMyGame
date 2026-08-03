@@ -9,6 +9,11 @@ build/Build
 build.app
 build
 .DS_Store
+apikey.txt
+sshpw.txt
+.env
+Server/**/bin/
+Server/**/obj/
 .freebuff/
 actions-runner
 *.slnx

@@ -1,0 +1,23 @@
+name: Unity WebGL
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test-and-build:
+    runs-on: [self-hosted, Windows, unity-6000.5.6f1]
+    steps:
+      - uses: actions/checkout@v4
+        with: { lfs: true }
+      - name: EditMode tests
+        shell: pwsh
+        run: '& "${env:UNITY_PATH}" -batchmode -nographics -quit -projectPath $PWD -runTests -testPlatform EditMode -testResults TestResults/editmode.xml'
+      - name: PlayMode tests
+        shell: pwsh
+        run: '& "${env:UNITY_PATH}" -batchmode -nographics -quit -projectPath $PWD -runTests -testPlatform PlayMode -testResults TestResults/playmode.xml'
+      - name: WebGL build
+        shell: pwsh
+        run: '& "${env:UNITY_PATH}" -batchmode -nographics -quit -projectPath $PWD -executeMethod BuildScript.BuildWebGL'
+      - uses: actions/upload-artifact@v4
+        with: { name: webgl, path: build/webgl }

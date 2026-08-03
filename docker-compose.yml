@@ -1,0 +1,14 @@
+services:
+  onlymygame-api:
+    build:
+      context: .
+      dockerfile: Server/OnlyMyGame.Api/Dockerfile
+    ports: ["8080:8080"]
+    volumes: ["onlymygame-data:/data"]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set in NAS secret or environment}
+      ONLYMYGAME_ALLOWED_ORIGIN: ${ONLYMYGAME_ALLOWED_ORIGIN:?GitHub Pages origin}
+      ONLYMYGAME_DAILY_SALT: ${ONLYMYGAME_DAILY_SALT:?daily hashing secret}
+    restart: unless-stopped
+volumes:
+  onlymygame-data:

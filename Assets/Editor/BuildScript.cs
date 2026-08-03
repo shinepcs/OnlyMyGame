@@ -22,6 +22,11 @@ public class BuildScript
         // 씬 목록 설정
         string[] scenes = GetScenePathsFromSettings();
 
+        // GitHub Pages는 별도 압축 헤더를 보장하지 않으므로 파일 자체를 그대로 제공한다.
+        PlayerSettings.WebGL.compressionFormat = WebGLCompressionFormat.Disabled;
+        PlayerSettings.WebGL.decompressionFallback = true;
+        PlayerSettings.WebGL.threadsSupport = false;
+
         // WebGL 빌드 옵션
         BuildPlayerOptions buildOptions = new BuildPlayerOptions
         {

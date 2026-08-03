@@ -1,0 +1,12 @@
+._*
+**/._*
+.DS_Store
+.git
+Library
+Logs
+Temp
+obj
+bin
+apikey.txt
+sshpw.txt
+.env
