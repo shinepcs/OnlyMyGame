@@ -17,3 +17,5 @@ Server/**/obj/
 .freebuff/
 actions-runner
 *.slnx
+OnlyMyGame.Runtime.csproj
+OnlyMyGame.Tests.csproj

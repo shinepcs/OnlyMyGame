@@ -42,12 +42,12 @@ namespace OnlyMyGame.Runtime
     public sealed class GameController : MonoBehaviour
     {
         private GameSnapshotV1 game; private readonly RuleVm vm = new RuleVm(); private readonly List<string> ledger = new List<string>(); private readonly List<CommandType> commands = new List<CommandType>();
-        private Dictionary<HexCoord, GameObject> visuals = new Dictionary<HexCoord, GameObject>(); private bool waitingForRules; private string apiBase; private GUIStyle header, body, button;
+        private Dictionary<HexCoord, GameObject> visuals = new Dictionary<HexCoord, GameObject>(); private bool waitingForRules; private string apiBase; private GUIStyle header, body, button; private GamePresentationCatalog presentation;
         [Serializable] private sealed class SaveEnvelope { public int schemaVersion = 1; public string payload; public string checksum; }
         [Serializable] private sealed class ClientConfig { public string apiBaseUrl; }
         private const string SaveKey = "onlymygame.autosave.v1"; private const string BackupKey = "onlymygame.autosave.v1.backup";
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)] static void Create() { if (FindFirstObjectByType<GameController>() == null) new GameObject("OnlyMyGame").AddComponent<GameController>(); }
-        private void Awake() { var config = Resources.Load<TextAsset>("OnlyMyGameConfig"); apiBase = config == null ? Environment.GetEnvironmentVariable("ONLYMYGAME_API_URL") ?? "" : JsonUtility.FromJson<ClientConfig>(config.text).apiBaseUrl ?? ""; LoadOrNew(); }
+        private void Awake() { var config = Resources.Load<TextAsset>("OnlyMyGameConfig"); apiBase = config == null ? Environment.GetEnvironmentVariable("ONLYMYGAME_API_URL") ?? "" : JsonUtility.FromJson<ClientConfig>(config.text).apiBaseUrl ?? ""; presentation = Resources.Load<GamePresentationCatalog>("OnlyMyGamePresentation"); LoadOrNew(); }
         private void BuildGui() { header = new GUIStyle(GUI.skin.label) { fontSize = 22, fontStyle = FontStyle.Bold, normal = { textColor = Color.white } }; body = new GUIStyle(GUI.skin.label) { fontSize = 14, wordWrap = true, normal = { textColor = Color.white } }; button = new GUIStyle(GUI.skin.button) { fontSize = 14 }; }
         private void LoadOrNew() { try { var saved = ReadSave(SaveKey) ?? ReadSave(BackupKey); game = saved ?? WorldGenerator.Create(Environment.TickCount); } catch { game = WorldGenerator.Create(Environment.TickCount); } BuildWorld(); ledger.Add("턴 " + game.turn + " — 세계가 열렸습니다."); }
         private void BuildWorld()
@@ -55,17 +55,36 @@ namespace OnlyMyGame.Runtime
             foreach (var item in visuals.Values) Destroy(item); visuals.Clear();
             foreach (var tile in game.map)
             {
-                var go = GameObject.CreatePrimitive(PrimitiveType.Cylinder); go.name = "Hex_" + tile.position; go.transform.position = HexToWorld(tile.position); go.transform.localScale = new Vector3(.92f, .08f, .92f);
-                var renderer = go.GetComponent<Renderer>(); renderer.material.color = tile.terrain == "강" ? new Color(.12f,.35f,.7f) : tile.terrain == "숲" ? new Color(.15f,.45f,.19f) : tile.terrain == "언덕" ? new Color(.48f,.35f,.18f) : new Color(.38f,.64f,.25f); visuals[tile.position] = go;
+                var prefab = tile.terrain == "강" ? presentation?.waterTile : presentation?.grassTile;
+                var go = prefab == null ? GameObject.CreatePrimitive(PrimitiveType.Cylinder) : Instantiate(prefab); go.name = "Hex_" + tile.position; go.transform.position = HexToWorld(tile.position); go.transform.localScale = prefab == null ? new Vector3(.92f, .08f, .92f) : Vector3.one * .82f;
+                var tint = tile.terrain == "강" ? new Color(.35f, .65f, 1f) : tile.terrain == "숲" ? new Color(.38f, .72f, .36f) : tile.terrain == "언덕" ? new Color(.76f, .58f, .32f) : new Color(.64f, .86f, .45f); Tint(go, tint); visuals[tile.position] = go;
             }
-            if (Camera.main == null) { var cam = new GameObject("Quarter Camera").AddComponent<Camera>(); cam.transform.position = new Vector3(0, 15, -13); cam.transform.rotation = Quaternion.Euler(52, 0, 0); cam.orthographic = true; cam.orthographicSize = 10; cam.clearFlags = CameraClearFlags.SolidColor; cam.backgroundColor = new Color(.06f,.1f,.16f); }
+            if (Camera.main == null)
+            {
+                var cam = new GameObject("Quarter Camera").AddComponent<Camera>(); cam.transform.position = new Vector3(0, 12, -10); cam.transform.rotation = Quaternion.Euler(52, 0, 0); cam.orthographic = true; cam.orthographicSize = 5.4f; cam.clearFlags = CameraClearFlags.SolidColor; cam.backgroundColor = new Color(.035f, .07f, .12f);
+                var light = new GameObject("World Sun").AddComponent<Light>(); light.type = LightType.Directional; light.color = new Color(1f, .91f, .73f); light.intensity = 1.35f; light.transform.rotation = Quaternion.Euler(50, -35, 0);
+                RenderSettings.ambientMode = UnityEngine.Rendering.AmbientMode.Flat; RenderSettings.ambientLight = new Color(.28f, .37f, .48f);
+            }
             RenderVisibility();
         }
         private Vector3 HexToWorld(HexCoord p) => new Vector3((p.q + p.r * .5f) * 1.65f, 0, p.r * 1.43f);
+        private static void Tint(GameObject visual, Color tint) { foreach (var renderer in visual.GetComponentsInChildren<Renderer>()) renderer.material.color = tint; }
+        private static GameObject Spawn(GameObject prefab, PrimitiveType fallback) => prefab == null ? GameObject.CreatePrimitive(fallback) : Instantiate(prefab);
         private void RenderVisibility()
         {
             foreach (var tile in game.map) if (visuals.TryGetValue(tile.position, out var go)) go.SetActive(tile.explored);
-            foreach (var unit in game.entities.Where(x => x.alive)) { var marker = GameObject.Find("Unit_" + unit.id) ?? GameObject.CreatePrimitive(PrimitiveType.Capsule); marker.name = "Unit_" + unit.id; marker.transform.position = HexToWorld(unit.position) + Vector3.up * .5f; marker.transform.localScale = Vector3.one * .45f; marker.GetComponent<Renderer>().material.color = unit.factionId == 1 ? Color.cyan : unit.factionId == 2 ? Color.red : Color.yellow; marker.SetActive(game.map.First(t => t.position.Equals(unit.position)).visible); }
+            foreach (var building in game.buildings)
+            {
+                var prefab = building.type == BuildingType.Headquarters ? (building.factionId == 1 ? presentation?.playerHeadquarters : presentation?.enemyHeadquarters) : presentation?.settlement;
+                var landmark = GameObject.Find("Building_" + building.id) ?? Spawn(prefab, PrimitiveType.Cube); landmark.name = "Building_" + building.id; landmark.transform.position = HexToWorld(building.position) + Vector3.up * .1f; landmark.transform.localScale = Vector3.one * (.38f + building.level * .04f); Tint(landmark, building.factionId == 1 ? new Color(.55f, .82f, 1f) : new Color(1f, .42f, .42f)); landmark.SetActive(game.map.First(t => t.position.Equals(building.position)).visible);
+            }
+            foreach (var unit in game.entities.Where(x => x.alive))
+            {
+                var prefab = unit.factionId == 1 ? presentation?.playerUnit : unit.factionId == 2 ? presentation?.skeletonUnit : presentation?.neutralUnit;
+                var marker = GameObject.Find("Unit_" + unit.id) ?? Spawn(prefab, PrimitiveType.Capsule); marker.name = "Unit_" + unit.id; marker.transform.position = HexToWorld(unit.position) + Vector3.up * .12f; marker.transform.localScale = Vector3.one * .42f; Tint(marker, unit.factionId == 1 ? new Color(.4f, .9f, 1f) : unit.factionId == 2 ? new Color(1f, .32f, .32f) : new Color(1f, .82f, .3f)); marker.SetActive(game.map.First(t => t.position.Equals(unit.position)).visible);
+                var label = GameObject.Find("UnitLabel_" + unit.id) ?? new GameObject("UnitLabel_" + unit.id); if (label.GetComponent<TextMesh>() == null) { var text = label.AddComponent<TextMesh>(); text.characterSize = .22f; text.fontSize = 48; text.anchor = TextAnchor.MiddleCenter; text.color = Color.white; }
+                label.GetComponent<TextMesh>().text = unit.factionId == 1 ? "★" : unit.factionId == 2 ? "☠" : "¤"; label.transform.position = marker.transform.position + Vector3.up * .62f; if (Camera.main != null) label.transform.rotation = Camera.main.transform.rotation; label.SetActive(marker.activeSelf);
+            }
         }
         private int Cost(CommandType type) => type == CommandType.Move ? 1 : type == CommandType.Build || type == CommandType.Upgrade ? 3 : 2;
         private void Queue(CommandType command) { var player = game.factions.First(f => f.id == 1); if (!waitingForRules && commands.Sum(Cost) + Cost(command) <= player.sp) { commands.Add(command); ledger.Add(CommandKorean(command) + " 명령을 예약했습니다. 예상 SP " + (player.sp - commands.Sum(Cost))); } }

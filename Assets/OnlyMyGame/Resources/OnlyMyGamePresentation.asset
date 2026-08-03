@@ -1,0 +1,22 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 91cd1dd0a2714799ae1061448e73ce12, type: 3}
+  m_Name: OnlyMyGamePresentation
+  m_EditorClassIdentifier:
+  grassTile: {fileID: 100100000, guid: 04532c617de154041b55e7debb3b6f16, type: 3}
+  waterTile: {fileID: 100100000, guid: e59faeb608d5b4ca4b271996c1d5ce86, type: 3}
+  playerUnit: {fileID: 100100000, guid: 61c548b42aa824944afad47d6b254c67, type: 3}
+  skeletonUnit: {fileID: 100100000, guid: a811eb7ec39b046a6bf6d9051206df55, type: 3}
+  neutralUnit: {fileID: 100100000, guid: 61c548b42aa824944afad47d6b254c67, type: 3}
+  playerHeadquarters: {fileID: 100100000, guid: 7941c077646604c2a8586ecf67db800e, type: 3}
+  enemyHeadquarters: {fileID: 100100000, guid: 3d41e874517e84773a94723b38e497c1, type: 3}
+  settlement: {fileID: 100100000, guid: 7c3da0866a553453693c3e9ffb08cb24, type: 3}
