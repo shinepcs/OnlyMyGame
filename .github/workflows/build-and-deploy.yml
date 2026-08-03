@@ -45,7 +45,7 @@ jobs:
         if: runner.os == 'Windows'
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
 
       # 4. unity-activate 설치 (Windows만 해당)
       - name: Install unity-activate
