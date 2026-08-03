@@ -1,0 +1,612 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main, copilot/deploy-github-pages]
+  workflow_dispatch:
+
+# GitHub Pages 배포를 위한 권한 설정
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 동시에 하나의 배포만 허용
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on:
+      - self-hosted
+      - OSX
+      - Arm64
+    steps:
+      # 1. 저장소 코드 체크아웃
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      # 2. Unity 라이브러리 캐시
+      - name: Cache Unity Library
+        uses: actions/cache@v3
+        with:
+          path: Library
+          key: Library-WebGL-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          restore-keys: |
+            Library-WebGL-
+            Library-
+
+      # 3. Node.js 설치 (unity-activate 사용을 위해 - Windows만 해당)
+      - name: Setup Node.js
+        if: runner.os == 'Windows'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 4. unity-activate 설치 (Windows만 해당)
+      - name: Install unity-activate
+        if: runner.os == 'Windows'
+        run: npm install -g unity-activate
+
+      # 5. ProjectVersion.txt에서 Unity 에디터 버전 읽기
+      - name: Read Unity version from ProjectVersion
+        shell: bash
+        run: |
+          UNITY_VERSION=$(awk -F': ' '/^m_EditorVersion:/ {print $2}' ProjectSettings/ProjectVersion.txt | tr -d '\r')
+          if [ -z "$UNITY_VERSION" ]; then
+            echo "ProjectSettings/ProjectVersion.txt 에서 m_EditorVersion 을 읽을 수 없습니다."
+            exit 1
+          fi
+
+          echo "UNITY_VERSION=$UNITY_VERSION" >> "$GITHUB_ENV"
+          echo "Project Unity version: $UNITY_VERSION"
+
+      # 6. Unity 라이센스 활성화 (Windows - PowerShell)
+      - name: Activate Unity License (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell -ExecutionPolicy Bypass -File {0}
+        env:
+          UNITY_PATH: ${{ vars.UNITY_PATH }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          # Unity 설치 경로 찾기
+          $unityPath = $env:UNITY_PATH
+          $unityVersion = $env:UNITY_VERSION
+          
+          if (-not $unityPath) {
+            # ProjectVersion.txt 버전 우선 사용
+            if ($unityVersion) {
+              $versionedPath = "C:\Program Files\Unity\Hub\Editor\$unityVersion\Editor\Unity.exe"
+              if (Test-Path $versionedPath) {
+                $unityPath = $versionedPath
+              }
+            }
+
+            # Unity Hub에서 자동 검색
+            $hubPath = "C:\Program Files\Unity\Hub\Editor"
+            if ((-not $unityPath) -and (Test-Path $hubPath)) {
+              $unityPath = Get-ChildItem -Path $hubPath -Directory | 
+                           Where-Object { $_.Name -match "^\d+\.\d+\.\d+f\d+" } | 
+                           Sort-Object Name -Descending | 
+                           Select-Object -First 1 | 
+                           ForEach-Object { Join-Path $_.FullName "Editor\Unity.exe" }
+            }
+            
+            # 대체 경로 확인
+            if (-not $unityPath -or -not (Test-Path $unityPath)) {
+              $altPaths = @(
+                "D:\UnityEditor\$unityVersion\Editor\Unity.exe",
+                "D:\Program Files\Unity\Hub\Editor\*\Editor\Unity.exe",
+                "C:\Program Files\Unity\Editor\Unity.exe"
+              )
+              foreach ($path in $altPaths) {
+                if ($path -like "*\*\*") {
+                  $found = Get-ChildItem -Path $path -ErrorAction SilentlyContinue | Select-Object -First 1
+                  if ($found) {
+                    $unityPath = $found.FullName
+                    break
+                  }
+                } elseif (Test-Path $path) {
+                  $unityPath = $path
+                  break
+                }
+              }
+            }
+          }
+          
+          if (-not $unityPath -or -not (Test-Path $unityPath)) {
+            Write-Error "Unity를 찾을 수 없습니다. UNITY_PATH 환경변수를 설정하거나 Unity를 설치해주세요."
+            exit 1
+          }
+          
+          Write-Host "Unity 경로: $unityPath"
+          
+          # Unity 이메일 및 패스워드 확인
+          $unityEmail = $env:UNITY_EMAIL
+          $unityPassword = $env:UNITY_PASSWORD
+          
+          if ($unityEmail -and $unityPassword) {
+            Write-Host "Unity 라이센스를 EMAIL/PASSWORD로 활성화합니다..."
+            
+            # Unity 라이센스 파일 경로 (Windows)
+            $licensePath = "$env:ProgramData\Unity\Unity_lic.ulf"
+            $licenseDir = Split-Path $licensePath -Parent
+            
+            # 디렉토리가 없으면 생성
+            if (-not (Test-Path $licenseDir)) {
+              New-Item -Path $licenseDir -ItemType Directory -Force | Out-Null
+            }
+            
+            # ALF 파일 생성 (Manual Activation File)
+            $alfFile = Join-Path $PWD.Path "Unity.alf"
+            Write-Host "ALF 파일 생성 중: $alfFile"
+            
+            $process = Start-Process -FilePath $unityPath `
+              -ArgumentList "-batchmode", "-nographics", "-quit", "-createManualActivationFile", "-logFile", "-" `
+              -Wait -PassThru -NoNewWindow
+            
+            if (-not (Test-Path $alfFile)) {
+              Write-Error "ALF 파일 생성 실패 (Exit Code: $($process.ExitCode))"
+              exit 1
+            }
+            
+            Write-Host "ALF 파일이 생성되었습니다: $alfFile"
+            
+            # unity-activate를 사용하여 라이센스 활성화
+            Write-Host "unity-activate를 사용하여 라이센스 활성화 중..."
+            
+            # unity-activate 실행 (PATH에서 직접 실행)
+            try {
+              & unity-activate --username $unityEmail --password $unityPassword --out $licenseDir $alfFile
+              
+              if ($LASTEXITCODE -ne 0) {
+                Write-Error "Unity 라이센스 활성화 실패 (Exit Code: $LASTEXITCODE)"
+                exit $LASTEXITCODE
+              }
+            } catch {
+              Write-Error "Unity 라이센스 활성화 실패: $_"
+              exit 1
+            }
+            
+            Write-Host "Unity 라이센스가 활성화되었습니다: $licensePath"
+          } else {
+            Write-Host "UNITY_EMAIL 또는 UNITY_PASSWORD 시크릿이 설정되지 않았습니다. 기존 라이센스를 사용합니다."
+            Write-Host "참고: Self-hosted runner에서 Unity를 수동으로 활성화했거나, 유효한 라이센스 파일이 이미 존재해야 합니다."
+          }
+          
+          # 라이센스 상태 확인 (간단한 테스트)
+          Write-Host "`n라이센스 상태를 확인합니다..."
+          $testLogFile = Join-Path $PWD.Path "license-test.log"
+          
+          $process = Start-Process -FilePath $unityPath `
+            -ArgumentList "-batchmode", "-nographics", "-quit", "-logFile", $testLogFile `
+            -Wait -PassThru -NoNewWindow
+          
+          # 로그 확인
+          if (Test-Path $testLogFile) {
+            $logContent = Get-Content $testLogFile -Raw
+            
+            # 라이센스 오류 확인 (정확한 패턴 매칭)
+            if ($logContent -match "No valid Unity Editor license found" -or $logContent -match "Error.*com\.unity\.editor\.headless.*not found") {
+              Write-Host "`n=== License Test Log ===`n"
+              Get-Content $testLogFile | Select-Object -Last 30
+              Write-Warning "Unity 라이센스가 활성화되지 않았습니다."
+            } else {
+              Write-Host "Unity 라이센스가 정상적으로 확인되었습니다."
+            }
+          }
+
+      # 7. Unity 라이센스 활성화 (macOS - bash)
+      - name: Activate Unity License (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          UNITY_PATH: ${{ vars.UNITY_PATH }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          # Unity 설치 경로 찾기
+          UNITY_PATH="${UNITY_PATH}"
+          UNITY_VERSION="${UNITY_VERSION}"
+          
+          if [ -z "$UNITY_PATH" ]; then
+            # ProjectVersion.txt 버전 우선 사용
+            if [ -n "$UNITY_VERSION" ]; then
+              VERSIONED_PATH="/Applications/Unity/Hub/Editor/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
+              if [ -f "$VERSIONED_PATH" ]; then
+                UNITY_PATH="$VERSIONED_PATH"
+              fi
+            fi
+
+            # Unity Hub에서 자동 검색
+            HUB_PATH="/Applications/Unity/Hub/Editor"
+            if [ -z "$UNITY_PATH" ] && [ -d "$HUB_PATH" ]; then
+              # 가장 최신 버전 찾기
+              UNITY_PATH=$(find "$HUB_PATH" -maxdepth 2 -name "Unity.app" -type d | sort -r | head -n 1)
+              if [ -n "$UNITY_PATH" ]; then
+                UNITY_PATH="$UNITY_PATH/Contents/MacOS/Unity"
+              fi
+            fi
+            
+            # 대체 경로 확인
+            if [ -z "$UNITY_PATH" ] || [ ! -f "$UNITY_PATH" ]; then
+              ALT_PATHS=(
+                "/Applications/Unity/Hub/Editor/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
+                "/Applications/Unity/Unity.app/Contents/MacOS/Unity"
+              )
+              for path in "${ALT_PATHS[@]}"; do
+                if [ -f "$path" ]; then
+                  UNITY_PATH="$path"
+                  break
+                fi
+              done
+            fi
+          fi
+          
+          if [ -z "$UNITY_PATH" ] || [ ! -f "$UNITY_PATH" ]; then
+            echo "Unity를 찾을 수 없습니다. UNITY_PATH 환경변수를 설정하거나 Unity를 설치해주세요."
+            exit 1
+          fi
+          
+          echo "Unity 경로: $UNITY_PATH"
+
+          has_license_error() {
+            local log_file="$1"
+            [ -f "$log_file" ] && grep -Eiq "No valid Unity Editor license found|Unity Editor requires a valid license|No license file was found|LICENSE SYSTEM.*(Error|failed)|Failed to activate|Your serial number is invalid|Entitlement.*not found" "$log_file"
+          }
+
+          has_license_success() {
+            local log_file="$1"
+            [ -f "$log_file" ] && grep -Eiq "Product: Unity Personal|License group:|Successfully updated license|Licensing is initialized|Successfully resolved entitlement details" "$log_file"
+          }
+
+          if [ -n "$UNITY_EMAIL" ] && [ -n "$UNITY_PASSWORD" ]; then
+            echo "Unity 라이센스를 EMAIL/PASSWORD로 활성화합니다..."
+            LOG_FILE="$PWD/activation.log"
+            
+            set +e
+            "$UNITY_PATH" \
+              -batchmode \
+              -nographics \
+              -quit \
+              -username "$UNITY_EMAIL" \
+              -password "$UNITY_PASSWORD" \
+              -logFile "$LOG_FILE"
+            
+            ACTIVATION_EXIT_CODE=$?
+            set -e
+            
+            # 로그 출력
+            echo ""
+            echo "=== Unity Activation Log ==="
+            if [ -f "$LOG_FILE" ]; then
+              tail -n 120 "$LOG_FILE"
+            else
+              echo "activation.log 파일이 생성되지 않았습니다."
+            fi
+            echo ""
+            
+            if [ $ACTIVATION_EXIT_CODE -eq 0 ] || has_license_success "$LOG_FILE"; then
+              echo "Unity 라이센스가 성공적으로 활성화되었습니다."
+            else
+              echo "Unity 라이센스 활성화 명령이 실패했습니다 (Exit Code: $ACTIVATION_EXIT_CODE)."
+              echo "라이센스 상태를 확인합니다..."
+            fi
+          else
+            echo "UNITY_EMAIL 또는 UNITY_PASSWORD 시크릿이 설정되지 않았습니다. 기존 라이센스를 사용합니다."
+            echo "Self-hosted runner에서 Unity를 수동으로 활성화했거나, 유효한 라이센스 파일이 이미 존재해야 합니다."
+          fi
+          
+          # 라이센스 상태 확인 (간단한 테스트)
+          echo ""
+          echo "라이센스 상태를 확인합니다..."
+          TEST_LOG_FILE="$PWD/license-test.log"
+          
+          set +e
+          "$UNITY_PATH" -batchmode -nographics -quit -logFile "$TEST_LOG_FILE"
+          TEST_EXIT_CODE=$?
+          set -e
+          
+          # 로그 확인
+          if [ -f "$TEST_LOG_FILE" ]; then
+            if has_license_success "$TEST_LOG_FILE"; then
+              echo "Unity 라이센스가 정상적으로 확인되었습니다."
+              if [ $TEST_EXIT_CODE -ne 0 ]; then
+                echo "Unity가 라이센스 확인 후 Exit Code $TEST_EXIT_CODE 로 종료했지만, 라이센스는 정상입니다. 이후 빌드 단계에서 실제 프로젝트 오류를 확인합니다."
+              fi
+            elif has_license_error "$TEST_LOG_FILE"; then
+              echo ""
+              echo "=== License Test Log ==="
+              echo ""
+              tail -n 120 "$TEST_LOG_FILE"
+              echo "Unity 라이센스가 활성화되지 않았습니다."
+              echo "UNITY_EMAIL/UNITY_PASSWORD 시크릿 값, Unity 계정 비밀번호 로그인 가능 여부, 2FA 설정을 확인해주세요."
+              exit 1
+            elif [ $TEST_EXIT_CODE -ne 0 ]; then
+              echo ""
+              echo "=== License Test Log ==="
+              echo ""
+              tail -n 120 "$TEST_LOG_FILE"
+              echo "Unity 라이센스 성공 여부를 확인할 수 없고 Unity가 Exit Code $TEST_EXIT_CODE 로 종료했습니다."
+              exit $TEST_EXIT_CODE
+            else
+              echo "Unity 라이센스가 정상적으로 확인되었습니다."
+            fi
+          else
+            echo "license-test.log 파일이 생성되지 않았습니다. Unity 실행 또는 권한 문제를 확인해주세요."
+            exit 1
+          fi
+
+      # 8. Unity 빌드 실행 (Windows - PowerShell)
+      - name: Build Unity WebGL (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell -ExecutionPolicy Bypass -File {0}
+        env:
+          UNITY_PATH: ${{ vars.UNITY_PATH }}
+        run: |
+          # Unity 설치 경로 찾기
+          $unityPath = $env:UNITY_PATH
+          $unityVersion = $env:UNITY_VERSION
+          
+          if (-not $unityPath) {
+            # ProjectVersion.txt 버전 우선 사용
+            if ($unityVersion) {
+              $versionedPath = "C:\Program Files\Unity\Hub\Editor\$unityVersion\Editor\Unity.exe"
+              if (Test-Path $versionedPath) {
+                $unityPath = $versionedPath
+              }
+            }
+
+            # Unity Hub에서 자동 검색
+            $hubPath = "C:\Program Files\Unity\Hub\Editor"
+            if ((-not $unityPath) -and (Test-Path $hubPath)) {
+              $unityPath = Get-ChildItem -Path $hubPath -Directory | 
+                           Where-Object { $_.Name -match "^\d+\.\d+\.\d+f\d+" } | 
+                           Sort-Object Name -Descending | 
+                           Select-Object -First 1 | 
+                           ForEach-Object { Join-Path $_.FullName "Editor\Unity.exe" }
+            }
+            
+            # 대체 경로 확인
+            if (-not $unityPath -or -not (Test-Path $unityPath)) {
+              $altPaths = @(
+                "D:\UnityEditor\$unityVersion\Editor\Unity.exe",
+                "D:\Program Files\Unity\Hub\Editor\*\Editor\Unity.exe",
+                "C:\Program Files\Unity\Editor\Unity.exe"
+              )
+              foreach ($path in $altPaths) {
+                if ($path -like "*\*\*") {
+                  $found = Get-ChildItem -Path $path -ErrorAction SilentlyContinue | Select-Object -First 1
+                  if ($found) {
+                    $unityPath = $found.FullName
+                    break
+                  }
+                } elseif (Test-Path $path) {
+                  $unityPath = $path
+                  break
+                }
+              }
+            }
+          }
+          
+          if (-not $unityPath -or -not (Test-Path $unityPath)) {
+            Write-Error "Unity를 찾을 수 없습니다. UNITY_PATH 환경변수를 설정하거나 Unity를 설치해주세요."
+            exit 1
+          }
+          
+          Write-Host "Unity 경로: $unityPath"
+          
+          # Unity 빌드 실행
+          $projectPath = $PWD.Path
+          $logFile = Join-Path $projectPath "build.log"
+          
+          # Start-Process를 사용하여 프로세스를 실행하고 종료 코드를 캡처
+          # 참고: -batchmode와 -nographics는 앞쪽에 배치하여 Unity가 올바르게 batch mode로 실행되도록 합니다
+          $process = Start-Process -FilePath $unityPath `
+            -ArgumentList "-batchmode", "-nographics", "-quit", "-projectPath", $projectPath, "-buildTarget", "WebGL", "-executeMethod", "BuildScript.BuildWebGL", "-logFile", $logFile `
+            -Wait -PassThru -NoNewWindow
+          
+          $exitCode = $process.ExitCode
+          
+          # 로그 출력
+          if (Test-Path $logFile) {
+            Write-Host "`n=== Unity Build Log ===`n"
+            Get-Content $logFile | Select-Object -Last 100
+          }
+          
+          # 빌드 결과 확인
+          if ($exitCode -ne 0) {
+            Write-Error "Unity 빌드 실패 (Exit Code: $exitCode)"
+            exit $exitCode
+          }
+          
+          Write-Host "Unity 빌드 성공!"
+
+      # 9. Unity 빌드 실행 (macOS - bash)
+      - name: Build Unity WebGL (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          UNITY_PATH: ${{ vars.UNITY_PATH }}
+        run: |
+          # Unity 설치 경로 찾기
+          UNITY_PATH="${UNITY_PATH}"
+          UNITY_VERSION="${UNITY_VERSION}"
+          
+          if [ -z "$UNITY_PATH" ]; then
+            # ProjectVersion.txt 버전 우선 사용
+            if [ -n "$UNITY_VERSION" ]; then
+              VERSIONED_PATH="/Applications/Unity/Hub/Editor/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
+              if [ -f "$VERSIONED_PATH" ]; then
+                UNITY_PATH="$VERSIONED_PATH"
+              fi
+            fi
+
+            # Unity Hub에서 자동 검색
+            HUB_PATH="/Applications/Unity/Hub/Editor"
+            if [ -z "$UNITY_PATH" ] && [ -d "$HUB_PATH" ]; then
+              # 가장 최신 버전 찾기
+              UNITY_PATH=$(find "$HUB_PATH" -maxdepth 2 -name "Unity.app" -type d | sort -r | head -n 1)
+              if [ -n "$UNITY_PATH" ]; then
+                UNITY_PATH="$UNITY_PATH/Contents/MacOS/Unity"
+              fi
+            fi
+            
+            # 대체 경로 확인
+            if [ -z "$UNITY_PATH" ] || [ ! -f "$UNITY_PATH" ]; then
+              ALT_PATHS=(
+                "/Applications/Unity/Hub/Editor/$UNITY_VERSION/Unity.app/Contents/MacOS/Unity"
+                "/Applications/Unity/Unity.app/Contents/MacOS/Unity"
+              )
+              for path in "${ALT_PATHS[@]}"; do
+                if [ -f "$path" ]; then
+                  UNITY_PATH="$path"
+                  break
+                fi
+              done
+            fi
+          fi
+          
+          if [ -z "$UNITY_PATH" ] || [ ! -f "$UNITY_PATH" ]; then
+            echo "Unity를 찾을 수 없습니다. UNITY_PATH 환경변수를 설정하거나 Unity를 설치해주세요."
+            exit 1
+          fi
+          
+          echo "Unity 경로: $UNITY_PATH"
+          
+          # Unity 빌드 실행
+          PROJECT_PATH="$PWD"
+          LOG_FILE="$PROJECT_PATH/build.log"
+          
+          # Unity 빌드 명령 실행
+          "$UNITY_PATH" -batchmode -nographics -quit -projectPath "$PROJECT_PATH" -buildTarget WebGL -executeMethod BuildScript.BuildWebGL -logFile "$LOG_FILE" || EXIT_CODE=$?
+          EXIT_CODE=${EXIT_CODE:-0}
+          
+          # 로그 출력
+          if [ -f "$LOG_FILE" ]; then
+            echo ""
+            echo "=== Unity Build Log ==="
+            echo ""
+            tail -n 100 "$LOG_FILE"
+          fi
+          
+          # 빌드 결과 확인
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "Unity 빌드 실패 (Exit Code: $EXIT_CODE)"
+            exit $EXIT_CODE
+          fi
+          
+          echo "Unity 빌드 성공!"
+
+      # 10. Gzip 압축 파일 해제 (Windows - PowerShell)
+      - name: Decompress build files (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell -ExecutionPolicy Bypass -File {0}
+        run: |
+          $buildDir = "build\webgl\Build"
+          if (Test-Path $buildDir) {
+            Get-ChildItem -Path $buildDir -Filter *.gz | ForEach-Object {
+              $outFile = $_.FullName -replace '\.gz$', ''
+              Write-Host "Decompressing: $($_.Name)"
+              
+              # PowerShell을 사용한 Gzip 압축 해제 (리소스 자동 정리)
+              try {
+                $input = New-Object System.IO.FileStream $_.FullName, ([IO.FileMode]::Open), ([IO.FileAccess]::Read), ([IO.FileShare]::Read)
+                try {
+                  $output = New-Object System.IO.FileStream $outFile, ([IO.FileMode]::Create), ([IO.FileAccess]::Write), ([IO.FileShare]::None)
+                  try {
+                    $gzipStream = New-Object System.IO.Compression.GzipStream $input, ([IO.Compression.CompressionMode]::Decompress)
+                    try {
+                      $buffer = New-Object byte[](1024)
+                      while ($true) {
+                        $read = $gzipStream.Read($buffer, 0, 1024)
+                        if ($read -le 0) { break }
+                        $output.Write($buffer, 0, $read)
+                      }
+                    } finally {
+                      $gzipStream.Close()
+                    }
+                  } finally {
+                    $output.Close()
+                  }
+                } finally {
+                  $input.Close()
+                }
+                Write-Host "Decompressed: $($_.Name)"
+              } catch {
+                Write-Error "압축 해제 실패: $($_.Name) - $_"
+              }
+            }
+            
+            # index.html에서 .gz 확장자 제거
+            $indexFile = "build\webgl\index.html"
+            if (Test-Path $indexFile) {
+              (Get-Content $indexFile) -replace '\.gz"', '"' | Set-Content $indexFile
+              Write-Host "Updated index.html to reference decompressed files"
+            }
+          }
+
+      # 11. Gzip 압축 파일 해제 (macOS - bash)
+      - name: Decompress build files (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          BUILD_DIR="build/webgl/Build"
+          if [ -d "$BUILD_DIR" ]; then
+            for gz_file in "$BUILD_DIR"/*.gz; do
+              if [ -f "$gz_file" ]; then
+                echo "Decompressing: $(basename "$gz_file")"
+                gunzip -k "$gz_file"
+              fi
+            done
+            
+            # index.html에서 .gz 확장자 제거
+            INDEX_FILE="build/webgl/index.html"
+            if [ -f "$INDEX_FILE" ]; then
+              sed -i.bak 's/\.gz"/"/g' "$INDEX_FILE"
+              rm -f "$INDEX_FILE.bak"
+              echo "Updated index.html to reference decompressed files"
+            fi
+          fi
+
+      # 12. 빌드 결과물을 아티팩트로 업로드
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unity-webgl-build
+          path: build/webgl
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      # 1. 빌드 아티팩트 다운로드
+      - name: Download build artifact
+        uses: actions/download-artifact@v4.1.3
+        with:
+          name: unity-webgl-build
+          path: build
+
+      # 2. GitHub Pages 설정
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      # 3. 빌드 디렉토리를 아티팩트로 업로드
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './build'
+
+      # 4. GitHub Pages에 배포
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

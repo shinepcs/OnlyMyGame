@@ -1,0 +1,5 @@
+# Normalize text files and avoid platform-specific line-ending churn
+* text=auto
+
+# Enforce UTF-8 for C# sources in working tree
+*.cs text working-tree-encoding=UTF-8
