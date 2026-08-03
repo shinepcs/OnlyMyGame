@@ -35,10 +35,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: Library
-          key: Library-WebGL-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
-          restore-keys: |
-            Library-WebGL-
-            Library-
+          # Unity Library는 서로 다른 Unity/패키지 조합과 호환되지 않는다.
+          # restore-keys로 이전 캐시를 복원하면 UnityLinker가 오래된 어셈블리를
+          # 로드해 빌드가 실패할 수 있으므로 정확히 일치하는 키만 사용한다.
+          key: Library-WebGL-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
 
       # 3. Node.js 설치 (unity-activate 사용을 위해 - Windows만 해당)
       - name: Setup Node.js
