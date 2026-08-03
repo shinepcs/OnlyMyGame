@@ -20,8 +20,8 @@ jobs:
   build:
     runs-on:
       - self-hosted
-      - OSX
-      - Arm64
+      - macOS
+      - ARM64
     steps:
       # 1. 저장소 코드 체크아웃
       - name: Checkout code
