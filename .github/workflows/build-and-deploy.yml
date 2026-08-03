@@ -274,6 +274,7 @@ jobs:
               -batchmode \
               -nographics \
               -quit \
+              -projectPath "$GITHUB_WORKSPACE" \
               -username "$UNITY_EMAIL" \
               -password "$UNITY_PASSWORD" \
               -logFile "$LOG_FILE"
@@ -308,7 +309,9 @@ jobs:
           TEST_LOG_FILE="$PWD/license-test.log"
           
           set +e
-          "$UNITY_PATH" -batchmode -nographics -quit -logFile "$TEST_LOG_FILE"
+          # -projectPath가 없으면 Unity가 마지막으로 열었던 프로젝트를 다시 열려고 합니다.
+          # Self-hosted runner의 데스크톱 Unity와 충돌하지 않도록 체크아웃한 작업공간을 명시합니다.
+          "$UNITY_PATH" -batchmode -nographics -quit -projectPath "$GITHUB_WORKSPACE" -logFile "$TEST_LOG_FILE"
           TEST_EXIT_CODE=$?
           set -e
           
