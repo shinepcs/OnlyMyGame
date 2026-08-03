@@ -53,9 +53,9 @@
     <Analyzer Include="/Applications/Unity/Hub/Editor/6000.5.6f1/Unity.app/Contents/Resources/Scripting/BCLExtensions/TargetingPacks/netstandard2.1/analyzers/dotnet/roslyn4.0/cs/System.Text.Json.SourceGeneration.dll" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="Assets/Scripts/BuildInfoTextPresenter.cs" />
-    <Compile Include="Assets/Scripts/RotateCube.cs" />
-    <Compile Include="Assets/Scripts/MoveBoxOnTouch.cs" />
+    <Compile Include="Assets/Temp/Scripts/BuildInfoTextPresenter.cs" />
+    <Compile Include="Assets/Temp/Scripts/MoveBoxOnTouch.cs" />
+    <Compile Include="Assets/Temp/Scripts/RotateCube.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Assets/Resources/BuildInfo.txt" />
