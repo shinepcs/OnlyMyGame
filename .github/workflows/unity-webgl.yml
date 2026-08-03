@@ -10,6 +10,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { lfs: true }
+      - name: Resolve Unity executable
+        shell: pwsh
+        env:
+          UNITY_PATH: ${{ vars.UNITY_PATH }}
+        run: |
+          $unityPath = $env:UNITY_PATH
+          $unityVersion = (Select-String -Path 'ProjectSettings/ProjectVersion.txt' -Pattern '^m_EditorVersion:' |
+            Select-Object -First 1).Line -replace '^m_EditorVersion:\s*', ''
+
+          if (-not $unityVersion) {
+            throw 'Could not determine the Unity version from ProjectSettings/ProjectVersion.txt.'
+          }
+
+          $candidatePaths = @(
+            $unityPath,
+            "C:\Program Files\Unity\Hub\Editor\$unityVersion\Editor\Unity.exe",
+            "D:\UnityEditor\$unityVersion\Editor\Unity.exe",
+            "C:\Program Files\Unity\Editor\Unity.exe"
+          ) | Where-Object { $_ }
+
+          $unityPath = $candidatePaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+          if (-not $unityPath) {
+            throw "Unity $unityVersion was not found. Set the UNITY_PATH repository variable or install it under C:\Program Files\Unity\Hub\Editor or D:\UnityEditor."
+          }
+
+          "UNITY_PATH=$unityPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Using Unity: $unityPath"
       - name: EditMode tests
         shell: pwsh
         run: '& "${env:UNITY_PATH}" -batchmode -nographics -quit -projectPath $PWD -runTests -testPlatform EditMode -testResults TestResults/editmode.xml'
