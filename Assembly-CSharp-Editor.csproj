@@ -1304,16 +1304,16 @@
       <HintPath>Library/ScriptAssemblies/Unity.RenderPipelines.Universal.2D.Editor.Overrides.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="Unity.RenderPipelines.Universal.Editor">
+      <HintPath>Library/ScriptAssemblies/Unity.RenderPipelines.Universal.Editor.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="UnityEngine.UI">
       <HintPath>Library/ScriptAssemblies/UnityEngine.UI.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="Unity.Burst">
       <HintPath>Library/ScriptAssemblies/Unity.Burst.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    <Reference Include="Unity.RenderPipelines.Universal.Editor">
-      <HintPath>Library/ScriptAssemblies/Unity.RenderPipelines.Universal.Editor.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="Unity.PathTracing.Runtime">
@@ -1404,7 +1404,6 @@
   <ItemGroup>
     <ProjectReference Include="Assembly-CSharp.csproj" />
     <ProjectReference Include="OnlyMyGame.Runtime.csproj" />
-    <ProjectReference Include="OnlyMyGame.Editor.csproj" />
   </ItemGroup>
   <Import Project="Sdk.targets" Sdk="Microsoft.NET.Sdk" />
   <ItemGroup>
