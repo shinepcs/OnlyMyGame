@@ -35,10 +35,15 @@ var retryCooldownSeconds = int.TryParse(config["ONLYMYGAME_RETRY_COOLDOWN_SECOND
 var retentionDays = int.TryParse(config["ONLYMYGAME_RETENTION_DAYS"], out var parsedRetentionDays)
     ? ApiPolicies.NormalizeRetentionDays(parsedRetentionDays)
     : 30;
+var readinessCacheSeconds = int.TryParse(config["ONLYMYGAME_READINESS_CACHE_SECONDS"], out var parsedReadinessCacheSeconds)
+    ? Math.Clamp(parsedReadinessCacheSeconds, 1, 30)
+    : 5;
 const int MaxActiveSessionsPerIp = 2;
 const int SessionLifetimeSeconds = 3600;
 var allowedOrigins = ApiPolicies.ParseAllowedOrigins(config["ONLYMYGAME_ALLOWED_ORIGINS"] ?? config["ONLYMYGAME_ALLOWED_ORIGIN"]);
-var trustedProxies = ApiPolicies.ParseTrustedProxies(config["ONLYMYGAME_TRUSTED_PROXIES"]);
+var trustedProxyConfigurationValid = ApiPolicies.TryParseTrustedProxies(
+    config["ONLYMYGAME_TRUSTED_PROXIES"],
+    out var trustedProxies);
 var openAiBaseAddress = ParseOpenAiBaseAddress(config["ONLYMYGAME_OPENAI_BASE_URL"]);
 var dbPath = config["ONLYMYGAME_DB"] ?? "/data/onlymygame.db";
 var dbDirectory = Path.GetDirectoryName(dbPath);
@@ -56,7 +61,7 @@ using (var db = new SqliteConnection(connectionString))
 builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = MaxRequestBodyBytes);
 builder.Services.AddCors(options => options.AddPolicy(CorsPolicyName, policy => policy
     .WithOrigins(allowedOrigins)
-    .WithHeaders("Content-Type", "Authorization", "Idempotency-Key", "X-Unity-Version")
+    .WithHeaders("Content-Type", "Authorization", "Idempotency-Key", "X-Unity-Version", ApiPolicies.RuleCompatibilityHeader)
     .WithMethods("GET", "POST", "OPTIONS")
     .SetPreflightMaxAge(TimeSpan.FromHours(1))));
 if (trustedProxies.Length > 0)
@@ -83,6 +88,12 @@ builder.Services.AddHttpClient("openai", client =>
 });
 
 var app = builder.Build();
+var databaseReadiness = new DatabaseReadinessProbe(
+    connectionString,
+    TimeSpan.FromSeconds(readinessCacheSeconds),
+    app.Logger);
+if (!trustedProxyConfigurationValid)
+    app.Logger.LogError("ONLYMYGAME_TRUSTED_PROXIES must contain only explicit IP addresses.");
 if (trustedProxies.Length > 0) app.UseForwardedHeaders();
 app.Use(async (context, next) =>
 {
@@ -92,23 +103,19 @@ app.Use(async (context, next) =>
 });
 app.UseCors(CorsPolicyName);
 
+app.MapGet("/live", () => Results.Ok(new
+{
+    status = "ok",
+    apiVersion = ApiPolicies.ApiVersion,
+    compatibilityVersion = ApiPolicies.RuleCompatibilityVersion
+}));
+
 app.MapGet("/health", async (CancellationToken cancellationToken) =>
 {
-    var databaseOk = false;
-    try
-    {
-        await using var db = new SqliteConnection(connectionString);
-        await db.OpenAsync(cancellationToken);
-        await using var command = new SqliteCommand("SELECT 1", db);
-        databaseOk = Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken)) == 1;
-    }
-    catch (Exception ex)
-    {
-        app.Logger.LogError(ex, "Database health check failed.");
-    }
-
+    var databaseOk = await databaseReadiness.IsReadyAsync(cancellationToken);
     var configured = !string.IsNullOrWhiteSpace(config["OPENAI_API_KEY"])
-        && !string.IsNullOrWhiteSpace(config["ONLYMYGAME_DAILY_SALT"]);
+        && !string.IsNullOrWhiteSpace(config["ONLYMYGAME_DAILY_SALT"])
+        && trustedProxyConfigurationValid;
     var healthy = databaseOk && configured;
     return Results.Json(new
     {
@@ -136,10 +143,16 @@ app.MapPost("/v1/sessions", async (
     SessionRequest body,
     CancellationToken cancellationToken) =>
 {
+    if (!HasCurrentRuleCompatibility(context))
+        return Results.Json(new
+        {
+            error = "RULE_COMPATIBILITY_MISMATCH",
+            requiredCompatibilityVersion = ApiPolicies.RuleCompatibilityVersion
+        }, statusCode: StatusCodes.Status409Conflict);
     if (body == null || string.IsNullOrWhiteSpace(body.runId) || body.runId.Length > 128)
         return Results.BadRequest(new { error = "INVALID_RUN_ID" });
     var dailySalt = config["ONLYMYGAME_DAILY_SALT"];
-    if (string.IsNullOrWhiteSpace(dailySalt))
+    if (string.IsNullOrWhiteSpace(dailySalt) || !trustedProxyConfigurationValid)
         return Results.Json(new { error = "SERVICE_NOT_CONFIGURED" }, statusCode: StatusCodes.Status503ServiceUnavailable);
 
     var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
@@ -170,6 +183,12 @@ app.MapPost("/v1/rules/generate", async (
 {
     if (context.Request.ContentLength is > MaxRequestBodyBytes)
         return Results.Json(new { error = "REQUEST_TOO_LARGE" }, statusCode: StatusCodes.Status413PayloadTooLarge);
+    if (!HasCurrentRuleCompatibility(context))
+        return Results.Json(new
+        {
+            error = "RULE_COMPATIBILITY_MISMATCH",
+            requiredCompatibilityVersion = ApiPolicies.RuleCompatibilityVersion
+        }, statusCode: StatusCodes.Status409Conflict);
 
     var snapshotErrors = ApiPolicies.ValidateSnapshot(snapshot);
     if (snapshotErrors.Count > 0)
@@ -179,7 +198,9 @@ app.MapPost("/v1/rules/generate", async (
         return Results.BadRequest(new { error = "INVALID_IDEMPOTENCY_KEY" });
 
     var dailySalt = config["ONLYMYGAME_DAILY_SALT"];
-    if (string.IsNullOrWhiteSpace(config["OPENAI_API_KEY"]) || string.IsNullOrWhiteSpace(dailySalt))
+    if (string.IsNullOrWhiteSpace(config["OPENAI_API_KEY"])
+        || string.IsNullOrWhiteSpace(dailySalt)
+        || !trustedProxyConfigurationValid)
         return Results.Json(new { error = "SERVICE_NOT_CONFIGURED" }, statusCode: StatusCodes.Status503ServiceUnavailable);
 
     var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
@@ -428,32 +449,94 @@ static JsonSerializerOptions CreateRuleSetJsonOptions()
 
 static Dictionary<string, object> CreateRuleSetSchema()
 {
+    var stateReference = ClosedSchema(new Dictionary<string, object>
+    {
+        ["scope"] = EnumSchema("run", "turn", "faction", "unit", "building", "tile"),
+        ["scopeId"] = StringSchema(RuleLimits.MaxIdentifierLength),
+        ["key"] = StringSchema(RuleLimits.MaxIdentifierLength, 1)
+    });
+    var stateDefinition = ClosedSchema(new Dictionary<string, object>
+    {
+        ["scope"] = EnumSchema("run", "turn", "faction", "unit", "building", "tile"),
+        ["scopeId"] = StringSchema(RuleLimits.MaxIdentifierLength),
+        ["key"] = StringSchema(RuleLimits.MaxIdentifierLength, 1),
+        ["valueType"] = EnumSchema("number", "boolean", "set"),
+        ["koreanName"] = StringSchema(RuleLimits.MaxNameLength, 1),
+        ["iconToken"] = StringSchema(RuleLimits.MaxIdentifierLength, 1),
+        ["colorHex"] = StringSchema(7, 7),
+        ["initialNumber"] = IntegerSchema(-RuleLimits.MaxStateMagnitude, RuleLimits.MaxStateMagnitude),
+        ["initialBool"] = new Dictionary<string, object> { ["type"] = "boolean" },
+        ["initialSet"] = ArraySchema(StringSchema(RuleLimits.MaxIdentifierLength, 1), 0, RuleLimits.MaxStateSetElements)
+    });
+    var numberExpression = ClosedSchema(new Dictionary<string, object>
+    {
+        ["op"] = EnumSchema("constant", "state", "add", "subtract", "multiply", "divide", "countUnits", "countBuildings", "countTiles", "distance", "recentActionRatio"),
+        ["constant"] = IntegerSchema(-RuleLimits.MaxStateMagnitude, RuleLimits.MaxStateMagnitude),
+        ["state"] = NullableRefSchema("#/$defs/stateReference"),
+        ["left"] = NullableRefSchema("#/$defs/numberExpression"),
+        ["right"] = NullableRefSchema("#/$defs/numberExpression"),
+        ["selector"] = StringSchema(RuleLimits.MaxIdentifierLength),
+        ["secondSelector"] = StringSchema(RuleLimits.MaxIdentifierLength),
+        ["action"] = EnumSchema("move", "gather", "hunt", "attack", "trade", "persuade", "hire", "build", "upgrade", "dynamic", "capture"),
+        ["recentTurns"] = IntegerSchema(1, RuleLimits.MaxRecentActionTurns)
+    });
+    var predicateExpression = ClosedSchema(new Dictionary<string, object>
+    {
+        ["op"] = EnumSchema("all", "any", "not", "numberEqual", "numberNotEqual", "numberGreater", "numberGreaterOrEqual", "numberLess", "numberLessOrEqual", "boolState", "setContains"),
+        ["children"] = ArraySchema(RefSchema("#/$defs/predicateExpression"), 0, RuleLimits.MaxConditionNodes),
+        ["child"] = NullableRefSchema("#/$defs/predicateExpression"),
+        ["left"] = NullableRefSchema("#/$defs/numberExpression"),
+        ["right"] = NullableRefSchema("#/$defs/numberExpression"),
+        ["state"] = NullableRefSchema("#/$defs/stateReference"),
+        ["element"] = StringSchema(RuleLimits.MaxIdentifierLength)
+    });
+    var stateMutation = ClosedSchema(new Dictionary<string, object>
+    {
+        ["op"] = EnumSchema("set", "add", "toggle", "setAdd", "setRemove"),
+        ["state"] = RefSchema("#/$defs/stateReference"),
+        ["numberValue"] = NullableRefSchema("#/$defs/numberExpression"),
+        ["boolValue"] = new Dictionary<string, object> { ["type"] = "boolean" },
+        ["setValues"] = ArraySchema(StringSchema(RuleLimits.MaxIdentifierLength, 1), 0, RuleLimits.MaxStateSetElements),
+        ["element"] = StringSchema(RuleLimits.MaxIdentifierLength)
+    });
     var condition = ClosedSchema(new Dictionary<string, object>
     {
         ["op"] = EnumSchema("always", "equal", "greaterOrEqual", "lessOrEqual", "hasTag", "ownerIs"),
         ["left"] = StringSchema(RuleLimits.MaxIdentifierLength),
         ["value"] = IntegerSchema(-RuleLimits.MaxStateMagnitude, RuleLimits.MaxStateMagnitude),
         ["text"] = StringSchema(RuleLimits.MaxIdentifierLength),
-        ["all"] = ArraySchema(RefSchema("#/$defs/condition"), 0, RuleLimits.MaxConditionNodes)
+        ["all"] = ArraySchema(RefSchema("#/$defs/condition"), 0, RuleLimits.MaxConditionNodes),
+        ["predicate"] = NullableRefSchema("#/$defs/predicateExpression")
     });
     var effect = ClosedSchema(new Dictionary<string, object>
     {
-        ["type"] = EnumSchema("resource", "sp", "relation", "status", "spawn", "unlockAction", "schedule", "factionSwitch"),
+        ["type"] = EnumSchema("resource", "sp", "relation", "status", "spawn", "unlockAction", "schedule", "factionSwitch", "typedState"),
         ["resource"] = EnumSchema("none", "food", "wood", "stone", "iron", "coin"),
         ["amount"] = IntegerSchema(-RuleLimits.MaxEffectMagnitude, RuleLimits.MaxEffectMagnitude),
         ["target"] = StringSchema(RuleLimits.MaxIdentifierLength),
         ["key"] = StringSchema(RuleLimits.MaxIdentifierLength),
         ["value"] = StringSchema(RuleLimits.MaxDescriptionLength),
-        ["delay"] = IntegerSchema(0, RuleLimits.MaxScheduleDelay)
+        ["delay"] = IntegerSchema(0, RuleLimits.MaxScheduleDelay),
+        ["stateMutation"] = NullableRefSchema("#/$defs/stateMutation")
+    });
+    var dynamicTargetSelector = ClosedSchema(new Dictionary<string, object>
+    {
+        ["kind"] = EnumSchema("none", "tile", "unit", "building"),
+        ["ownership"] = EnumSchema("any", "player", "nonPlayer", "neutral"),
+        ["visibility"] = EnumSchema("visible", "explored"),
+        ["minDistance"] = IntegerSchema(0, RuleLimits.MaxDynamicTargetDistance),
+        ["maxDistance"] = IntegerSchema(0, RuleLimits.MaxDynamicTargetDistance),
+        ["maxCandidates"] = IntegerSchema(1, RuleLimits.MaxDynamicTargetCandidates)
     });
     var rule = ClosedSchema(new Dictionary<string, object>
     {
         ["id"] = StringSchema(RuleLimits.MaxIdentifierLength, 1),
         ["name"] = StringSchema(RuleLimits.MaxNameLength, 1),
         ["description"] = StringSchema(RuleLimits.MaxDescriptionLength),
-        ["trigger"] = EnumSchema("turnStart", "turnEnd", "move", "attack", "kill", "gather", "build", "trade", "relationChanged", "tileEntered"),
+        ["trigger"] = EnumSchema("turnStart", "turnEnd", "move", "attack", "kill", "gather", "build", "trade", "relationChanged", "tileEntered", "capture"),
         ["condition"] = RefSchema("#/$defs/condition"),
         ["effects"] = ArraySchema(RefSchema("#/$defs/effect"), 1, RuleLimits.MaxEffectsPerRule),
+        ["stateDefinitions"] = ArraySchema(RefSchema("#/$defs/stateDefinition"), 0, RuleLimits.MaxStateDefinitionsPerRule),
         ["priority"] = IntegerSchema(-RuleLimits.MaxEffectMagnitude, RuleLimits.MaxEffectMagnitude),
         ["durationTurns"] = IntegerSchema(1, 30),
         ["appliedTurn"] = IntegerSchema(0, RuleLimits.MaxStateMagnitude),
@@ -469,6 +552,7 @@ static Dictionary<string, object> CreateRuleSetSchema()
         ["resourceAmount"] = IntegerSchema(0, RuleLimits.MaxEffectMagnitude),
         ["cooldown"] = IntegerSchema(0, RuleLimits.MaxScheduleDelay),
         ["availableTurn"] = IntegerSchema(0, RuleLimits.MaxStateMagnitude),
+        ["targetSelector"] = RefSchema("#/$defs/dynamicTargetSelector"),
         ["condition"] = RefSchema("#/$defs/condition"),
         ["effects"] = ArraySchema(RefSchema("#/$defs/effect"), 1, RuleLimits.MaxEffectsPerRule)
     });
@@ -477,7 +561,7 @@ static Dictionary<string, object> CreateRuleSetSchema()
         ["id"] = StringSchema(RuleLimits.MaxIdentifierLength, 1),
         ["title"] = StringSchema(RuleLimits.MaxNameLength, 1),
         ["description"] = StringSchema(RuleLimits.MaxDescriptionLength),
-        ["progressKey"] = EnumSchema("turn", "kills", "buildings", "coin", "move", "gather", "hunt", "attack", "trade", "persuade", "hire", "build", "upgrade"),
+        ["progressKey"] = EnumSchema("turn", "kills", "buildings", "coin", "territory", "alliances", "move", "gather", "hunt", "attack", "trade", "persuade", "hire", "build", "upgrade", "capture"),
         ["target"] = IntegerSchema(1, RuleLimits.MaxStateMagnitude),
         ["minimumTurns"] = IntegerSchema(3, RuleLimits.MaxScheduleDelay),
         ["announcedTurn"] = IntegerSchema(0, RuleLimits.MaxStateMagnitude),
@@ -492,11 +576,17 @@ static Dictionary<string, object> CreateRuleSetSchema()
         ["applyTurn"] = IntegerSchema(0, RuleLimits.MaxStateMagnitude),
         ["koreanSummary"] = StringSchema(RuleLimits.MaxDescriptionLength, 1),
         ["changes"] = ArraySchema(RefSchema("#/$defs/rule"), 1, 3),
-        ["actions"] = ArraySchema(RefSchema("#/$defs/action"), 0, 16),
+        ["actions"] = ArraySchema(RefSchema("#/$defs/action"), 0, RuleLimits.MaxDynamicActionsPerRuleSet),
         ["victoryContracts"] = ArraySchema(RefSchema("#/$defs/contract"), 0, RuleLimits.MaxVictoryContracts)
     });
     root["$defs"] = new Dictionary<string, object>
     {
+        ["stateReference"] = stateReference,
+        ["stateDefinition"] = stateDefinition,
+        ["numberExpression"] = numberExpression,
+        ["predicateExpression"] = predicateExpression,
+        ["stateMutation"] = stateMutation,
+        ["dynamicTargetSelector"] = dynamicTargetSelector,
         ["condition"] = condition,
         ["effect"] = effect,
         ["rule"] = rule,
@@ -547,9 +637,24 @@ static Dictionary<string, object> ArraySchema(object items, int minimum, int max
 
 static Dictionary<string, object> RefSchema(string reference) => new() { ["$ref"] = reference };
 
+static Dictionary<string, object> NullableRefSchema(string reference) => new()
+{
+    ["anyOf"] = new object[]
+    {
+        RefSchema(reference),
+        new Dictionary<string, object> { ["type"] = "null" }
+    }
+};
+
 static string ComputeSessionIpHash(string dailySalt, string ip)
 {
     return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(dailySalt + "|session|" + ip)));
+}
+
+static bool HasCurrentRuleCompatibility(HttpContext context)
+{
+    var values = context.Request.Headers[ApiPolicies.RuleCompatibilityHeader];
+    return values.Count == 1 && string.Equals(values[0], ApiPolicies.RuleCompatibilityVersion, StringComparison.Ordinal);
 }
 
 static Uri ParseOpenAiBaseAddress(string? configuredAddress)
@@ -630,11 +735,15 @@ static async Task<RuleSetV1> GenerateRules(
         : contractIds.Length >= RuleLimits.MaxVictoryContracts
             ? "승리 계약이 3개로 가득 찼다. 새 id를 만들지 말고 기존 id만 사용하라. 계약 교체는 같은 id로 제안하며 서버가 최소 유지 기간과 1턴 사전 경고를 강제한다. 기존 계약 id: " + string.Join(",", contractIds) + ". "
             : "계약을 교체하려면 기존 id를 재사용하라. 실제 교체 전 최소 유지 기간과 1턴 사전 경고가 필요하다. 기존 계약 id: " + string.Join(",", contractIds) + ". ";
-    var prompt = "당신은 OnlyMyGame의 안전한 규칙 설계자다. 한국어 RuleSetV1 JSON만 출력한다. strict schema의 모든 필드를 채우고 사용하지 않는 문자열은 빈 문자열, condition.all은 빈 배열로 둬라. changes는 절대로 비워 두지 말고 정확히 1~3개의 규칙을 넣어라. 각 규칙에는 id, name, description, trigger(turnStart/turnEnd/move/attack/kill/gather/build/trade/relationChanged/tileEntered), condition(op는 always 사용 가능), effects(반드시 1개 이상), priority, durationTurns(1~30), appliedTurn, worldCue를 넣어라. effects에는 type resource, resource food, amount 1처럼 안전한 양수 효과를 사용해도 된다. actions는 만들 항목이 없으면 빈 배열로 둬라. 즉시 승리·패배, 숨은 규칙, 음수 자원, 코드 실행, 반복·재귀는 절대 만들지 마라. 새 승리조건은 즉시 달성할 수 없고 minimumTurns가 18 이상이어야 한다. "
+    var prompt = "당신은 OnlyMyGame의 안전한 규칙 설계자다. 한국어 RuleSetV1 JSON만 출력한다. strict schema의 모든 필드를 채워라. 사용하지 않는 문자열은 빈 문자열, 배열은 빈 배열, nullable AST 필드는 null로 둬라. 단순 조건은 predicate:null, 단순 효과는 stateMutation:null, 논리 상태가 없으면 stateDefinitions:[]로 둔다. changes는 절대로 비우지 말고 정확히 1~3개의 규칙을 넣어라. 각 규칙에는 id, name, description, trigger(turnStart/turnEnd/move/attack/kill/gather/build/trade/relationChanged/tileEntered/capture), condition, effects(반드시 1개 이상), stateDefinitions, priority, durationTurns(1~30), appliedTurn, worldCue를 넣어라. effects에는 type resource, resource food, amount 1처럼 안전한 양수 효과를 사용할 수 있다. 입력 snapshot은 플레이어에게 공개된 정보만 담으며, 미탐사 지형과 안개 속 적은 의도적으로 생략·마스킹되어 있다. 존재를 추측하거나 공개되지 않은 id를 만들지 마라. " +
+        "새 논리 상태가 게임 의미를 분명히 개선할 때만 typedState를 사용하라. 한 규칙의 stateDefinitions는 최대 4개이고 한 응답에서 신규 typed/legacy 상태 identity 합계도 최대 4개다. 새 상태에는 legacy status보다 stateDefinitions+typedState를 우선하라. stateDefinitions는 run/turn/faction/unit/building/tile scope, number/boolean/set 타입, 한국어 이름, 영숫자 iconToken, #RRGGBB 색을 갖는다. run/turn의 scopeId는 빈 문자열, 나머지는 공개 snapshot에 실제 존재하는 faction:N, unit:N, building:N, tile:q,r 또는 faction의 player만 사용하라. typedState 효과는 같은 규칙이나 기존 활성 규칙에 정의된 상태만 변경한다. 숫자식은 constant/state/add/subtract/multiply/divide/countUnits/countBuildings/countTiles/distance/recentActionRatio, predicate는 all/any/not/숫자비교/boolState/setContains만 사용하며 깊이 4와 256노드 이내, 0 나눗셈·순환·오버플로 없이 작성하라. 사용하지 않는 식의 child/left/right/state/numberValue는 null로 둬라. " +
+        "모든 action에는 targetSelector를 반드시 넣어라. 기존 즉시 실행 행동은 kind:none, ownership:any, visibility:visible, minDistance:0, maxDistance:0, maxCandidates:16이다. 대상 행동은 kind tile/unit/building과 ownership any/player/nonPlayer/neutral, 거리 0~32, 후보 1~32를 사용한다. unit/building은 visibility:visible만 허용하고 tile만 visible 또는 explored를 사용할 수 있다. 대상 ID를 직접 만들지 말고 실행 시 플레이어가 고르게 하라. 대상 행동은 조건 또는 효과의 허용 위치에서 $target/$tile/$owner 중 하나를 반드시 실제로 사용해야 하며 $actor만 쓰는 가짜 대상 행동은 금지한다. 조건 숫자식 selector에는 허용되는 위치에서만 $actor/$target/$tile/$owner를, HasTag.left에는 $actor 또는 unit 대상의 $target을, OwnerIs selector에는 $tile을 쓸 수 있다. 효과 target 바인딩은 factionSwitch의 $target, spawn/relation의 $owner만 허용한다. visibility:explored에서는 현재 숨은 소유자를 추론하지 못하도록 $owner를 어떤 조건·효과 위치에서도 사용하지 마라. StateReference의 scopeId/key에는 동적 바인딩 토큰을 사용할 수 없다. " +
+        "승리 진행은 turn/kills/buildings/coin/territory/alliances 및 누적 행동 move/gather/hunt/attack/trade/persuade/hire/build/upgrade/capture 중 현재 월드에서 6턴 안에 도달 가능한 키만 사용하라. actions는 최대 3개이며 만들 항목이 없으면 빈 배열로 둬라. 즉시 승리·패배, 숨은 규칙, 음수 자원, 코드 실행, 반복·재귀는 절대 만들지 마라. 새 승리조건은 즉시 달성할 수 없고 minimumTurns가 18 이상이어야 한다. "
         + capacityPrompt
         + contractPrompt
         + (repair == null ? string.Empty : "이전 검증 진단: " + string.Join(";", repair));
     var jsonOptions = CreateRuleSetJsonOptions();
+    var publicSnapshot = ApiPolicies.BuildPublicRuleDesignerSnapshot(snapshot);
     var payload = new
     {
         model = modelName,
@@ -642,7 +751,7 @@ static async Task<RuleSetV1> GenerateRules(
         input = new[]
         {
             new { role = "system", content = new[] { new { type = "input_text", text = prompt } } },
-            new { role = "user", content = new[] { new { type = "input_text", text = JsonSerializer.Serialize(snapshot, jsonOptions) } } }
+            new { role = "user", content = new[] { new { type = "input_text", text = JsonSerializer.Serialize(publicSnapshot, jsonOptions) } } }
         },
         text = new { format = new { type = "json_schema", name = "onlymygame_ruleset", strict = true, schema } }
     };
@@ -715,4 +824,86 @@ public partial class Program
 public sealed class SessionRequest
 {
     public string? runId { get; set; }
+}
+
+internal sealed class DatabaseReadinessProbe
+{
+    private const string ProbeName = "__onlymygame_readiness_probe__";
+    private readonly string connectionString;
+    private readonly TimeSpan cacheDuration;
+    private readonly ILogger logger;
+    private readonly SemaphoreSlim gate = new(1, 1);
+    private readonly object cacheLock = new();
+    private DateTimeOffset cacheExpiresUtc = DateTimeOffset.MinValue;
+    private bool cachedResult;
+
+    public DatabaseReadinessProbe(string connectionString, TimeSpan cacheDuration, ILogger logger)
+    {
+        this.connectionString = connectionString;
+        this.cacheDuration = cacheDuration;
+        this.logger = logger;
+    }
+
+    public async Task<bool> IsReadyAsync(CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (cacheLock)
+        {
+            if (now < cacheExpiresUtc) return cachedResult;
+        }
+
+        await gate.WaitAsync(cancellationToken);
+        try
+        {
+            now = DateTimeOffset.UtcNow;
+            lock (cacheLock)
+            {
+                if (now < cacheExpiresUtc) return cachedResult;
+            }
+
+            var result = await ProbeWriteAndRollbackAsync(cancellationToken);
+            lock (cacheLock)
+            {
+                cachedResult = result;
+                cacheExpiresUtc = DateTimeOffset.UtcNow + cacheDuration;
+            }
+            return result;
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task<bool> ProbeWriteAndRollbackAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var database = new SqliteConnection(connectionString);
+            await database.OpenAsync(cancellationToken);
+            await using (var busyTimeout = new SqliteCommand("PRAGMA busy_timeout=250", database))
+                await busyTimeout.ExecuteNonQueryAsync(cancellationToken);
+            await using var transaction = database.BeginTransaction(deferred: false);
+            await using (var write = new SqliteCommand(
+                "INSERT INTO service_maintenance(name,performed_utc) VALUES($name,$now) ON CONFLICT(name) DO UPDATE SET performed_utc=excluded.performed_utc",
+                database,
+                transaction))
+            {
+                write.Parameters.AddWithValue("$name", ProbeName);
+                write.Parameters.AddWithValue("$now", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+                await write.ExecuteNonQueryAsync(cancellationToken);
+            }
+            await transaction.RollbackAsync(cancellationToken);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Database readiness write-and-rollback probe failed.");
+            return false;
+        }
+    }
 }

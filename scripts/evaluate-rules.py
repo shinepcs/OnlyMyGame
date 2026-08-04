@@ -34,7 +34,8 @@ CASE_COUNT = 100
 MAP_RADIUS = 8
 MAP_TILE_COUNT = 217
 EXPECTED_API_VERSION = "v1"
-EXPECTED_COMPATIBILITY_VERSION = "rules-v2-strict-2026-08"
+EXPECTED_COMPATIBILITY_VERSION = "rules-v4-targeting-2026-08"
+COMPATIBILITY_HEADER = "X-Rules-Compatibility"
 CONFIRMATION_ENV = "ONLYMYGAME_EVAL_CONFIRM"
 CONFIRMATION_VALUE = "RUN_100_PAID_REQUESTS"
 FIRST_VALID_THRESHOLD = 0.95
@@ -47,11 +48,27 @@ RESOURCE_TYPES = ("none", "food", "wood", "stone", "iron", "coin")
 REAL_RESOURCES = RESOURCE_TYPES[1:]
 FACTION_KINDS = ("player", "skeleton", "neutral")
 BUILDING_TYPES = ("headquarters", "warehouse", "workshop", "watchtower", "market", "barracks")
-EVENT_TYPES = ("turnStart", "turnEnd", "move", "attack", "kill", "gather", "build", "trade", "relationChanged", "tileEntered")
-EFFECT_TYPES = ("resource", "sp", "relation", "status", "spawn", "unlockAction", "schedule", "factionSwitch")
+EVENT_TYPES = ("turnStart", "turnEnd", "move", "attack", "kill", "gather", "build", "trade", "relationChanged", "tileEntered", "capture")
+EFFECT_TYPES = ("resource", "sp", "relation", "status", "spawn", "unlockAction", "schedule", "factionSwitch", "typedState")
 COMPARE_OPS = ("always", "equal", "greaterOrEqual", "lessOrEqual", "hasTag", "ownerIs")
-COMMAND_TYPES = ("move", "gather", "hunt", "attack", "trade", "persuade", "hire", "build", "upgrade", "dynamic")
-PROGRESS_KEYS = ("turn", "kills", "buildings", "coin", "move", "gather", "hunt", "attack", "trade", "persuade", "hire", "build", "upgrade")
+COMMAND_TYPES = ("move", "gather", "hunt", "attack", "trade", "persuade", "hire", "build", "upgrade", "dynamic", "capture")
+PROGRESS_KEYS = ("turn", "kills", "buildings", "coin", "territory", "alliances", "move", "gather", "hunt", "attack", "trade", "persuade", "hire", "build", "upgrade", "capture")
+STATE_SCOPES = ("run", "turn", "faction", "unit", "building", "tile")
+STATE_VALUE_TYPES = ("number", "boolean", "set")
+NUMBER_EXPRESSION_OPS = ("constant", "state", "add", "subtract", "multiply", "divide", "countUnits", "countBuildings", "countTiles", "distance", "recentActionRatio")
+PREDICATE_EXPRESSION_OPS = ("all", "any", "not", "numberEqual", "numberNotEqual", "numberGreater", "numberGreaterOrEqual", "numberLess", "numberLessOrEqual", "boolState", "setContains")
+STATE_MUTATION_OPS = ("set", "add", "toggle", "setAdd", "setRemove")
+DYNAMIC_TARGET_KINDS = ("none", "tile", "unit", "building")
+DYNAMIC_TARGET_OWNERSHIPS = ("any", "player", "nonPlayer", "neutral")
+DYNAMIC_TARGET_VISIBILITIES = ("visible", "explored")
+DYNAMIC_BINDING_TOKENS = ("$actor", "$target", "$tile", "$owner")
+MAX_AST_NODES = 256
+MAX_AST_DEPTH = 4
+MAX_STATE_SET_ELEMENTS = 32
+MAX_RECENT_ACTION_TURNS = 6
+MAX_DYNAMIC_TARGET_DISTANCE = 32
+MAX_DYNAMIC_TARGET_CANDIDATES = 32
+MAX_RULESET_ACTIONS = 3
 
 
 class EvaluationError(Exception):
@@ -134,13 +151,108 @@ def make_map(seed: int) -> list[dict[str, Any]]:
     return result
 
 
-def empty_condition(op: str = "always", *, left: str = "", value: int = 0, text: str = "") -> dict[str, Any]:
-    return {"op": op, "left": left, "value": value, "text": text, "all": []}
+def state_reference(scope: str, key: str, scope_id: str = "") -> dict[str, Any]:
+    return {"scope": scope, "scopeId": scope_id, "key": key}
+
+
+def number_expression(
+    op: str,
+    *,
+    constant: int = 0,
+    state: dict[str, Any] | None = None,
+    left: dict[str, Any] | None = None,
+    right: dict[str, Any] | None = None,
+    selector: str = "",
+    second_selector: str = "",
+    action: str = "move",
+    recent_turns: int = 1,
+) -> dict[str, Any]:
+    return {
+        "op": op,
+        "constant": constant,
+        "state": state,
+        "left": left,
+        "right": right,
+        "selector": selector,
+        "secondSelector": second_selector,
+        "action": action,
+        "recentTurns": recent_turns,
+    }
+
+
+def predicate_expression(
+    op: str,
+    *,
+    children: list[dict[str, Any]] | None = None,
+    child: dict[str, Any] | None = None,
+    left: dict[str, Any] | None = None,
+    right: dict[str, Any] | None = None,
+    state: dict[str, Any] | None = None,
+    element: str = "",
+) -> dict[str, Any]:
+    return {
+        "op": op,
+        "children": [] if children is None else children,
+        "child": child,
+        "left": left,
+        "right": right,
+        "state": state,
+        "element": element,
+    }
+
+
+def state_mutation(
+    op: str,
+    state: dict[str, Any],
+    *,
+    number_value: dict[str, Any] | None = None,
+    bool_value: bool = False,
+    set_values: list[str] | None = None,
+    element: str = "",
+) -> dict[str, Any]:
+    return {
+        "op": op,
+        "state": state,
+        "numberValue": number_value,
+        "boolValue": bool_value,
+        "setValues": [] if set_values is None else set_values,
+        "element": element,
+    }
+
+
+def dynamic_target_selector(
+    kind: str = "none",
+    *,
+    ownership: str = "any",
+    visibility: str = "visible",
+    min_distance: int = 0,
+    max_distance: int = 0,
+    max_candidates: int = 16,
+) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "ownership": ownership,
+        "visibility": visibility,
+        "minDistance": min_distance,
+        "maxDistance": max_distance,
+        "maxCandidates": max_candidates,
+    }
+
+
+def empty_condition(
+    op: str = "always",
+    *,
+    left: str = "",
+    value: int = 0,
+    text: str = "",
+    predicate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {"op": op, "left": left, "value": value, "text": text, "all": [], "predicate": predicate}
 
 
 def make_effect(case_index: int, rule_index: int) -> dict[str, Any]:
     variant = rule_index % 4
-    base = {"resource": "none", "amount": 0, "target": "", "key": "", "value": "", "delay": 0}
+    base = {"resource": "none", "amount": 0, "target": "", "key": "", "value": "", "delay": 0, "stateMutation": None}
     if variant == 0:
         base.update(type="resource", resource=REAL_RESOURCES[(case_index + rule_index) % len(REAL_RESOURCES)], amount=1 + case_index % 3)
     elif variant == 1:
@@ -166,6 +278,7 @@ def make_active_rule(case_index: int, rule_index: int, turn: int) -> dict[str, A
         "trigger": EVENT_TYPES[(case_index + rule_index) % len(EVENT_TYPES)],
         "condition": copy.deepcopy(conditions[rule_index % len(conditions)]),
         "effects": [make_effect(case_index, rule_index)],
+        "stateDefinitions": [],
         "priority": rule_index - 2,
         "durationTurns": 30,
         "appliedTurn": max(0, turn - rule_index - 1),
@@ -174,6 +287,7 @@ def make_active_rule(case_index: int, rule_index: int, turn: int) -> dict[str, A
 
 
 def make_dynamic_action(case_index: int, action_index: int, turn: int) -> dict[str, Any]:
+    selector = dynamic_target_selector()
     return {
         "id": f"existing-action-{case_index:03d}-{action_index}",
         "name": f"Representative Action {action_index}",
@@ -183,6 +297,7 @@ def make_dynamic_action(case_index: int, action_index: int, turn: int) -> dict[s
         "resourceAmount": 0,
         "cooldown": 2 + action_index,
         "availableTurn": max(0, turn - action_index),
+        "targetSelector": selector,
         "condition": empty_condition(),
         "effects": [
             {
@@ -193,6 +308,7 @@ def make_dynamic_action(case_index: int, action_index: int, turn: int) -> dict[s
                 "key": "",
                 "value": "",
                 "delay": 0,
+                "stateMutation": None,
             }
         ],
     }
@@ -314,7 +430,38 @@ def make_snapshot(case_index: int, run_id: str) -> dict[str, Any]:
             {"key": "omen", "value": case_index % 11},
             {"key": "season", "value": (case_index * 7) % 19},
         ],
-        "ruleBudget": {"turn": turn, "dispatches": case_index % 5, "activations": case_index % 7, "effects": case_index % 11, "spawnedEntities": 0, "loggedLimits": 0},
+        "typedRuleState": [
+            {
+                "scope": "run",
+                "scopeId": "",
+                "key": "evaluation_omen",
+                "valueType": "number",
+                "koreanName": "평가 징조",
+                "iconToken": "evaluation_omen",
+                "colorHex": "#33AAFF",
+                "numberValue": case_index % 17,
+                "boolValue": False,
+                "setValue": [],
+                "stateTurn": 0,
+            }
+        ],
+        "recentActionStats": [
+            {
+                "turn": max(0, turn - offset),
+                "type": COMMAND_TYPES[(case_index + offset) % len(COMMAND_TYPES)],
+                "count": 1 + (case_index + offset) % 5,
+            }
+            for offset in range(3)
+        ],
+        "ruleBudget": {
+            "turn": turn,
+            "dispatches": case_index % 5,
+            "conditionWork": (case_index * 17) % 2_000,
+            "activations": case_index % 7,
+            "effects": case_index % 11,
+            "spawnedEntities": 0,
+            "loggedLimits": 0,
+        },
         "journal": ["Representative evaluation state", f"Case {case_index:03d}"],
         "catalogHash": "kaykit-v1",
     }
@@ -421,28 +568,225 @@ def bounded_string(value: Any, maximum: int, allow_empty: bool = True) -> bool:
     return isinstance(value, str) and len(value) <= maximum and (allow_empty or bool(value.strip()))
 
 
-def validate_condition(condition: Any, path: str, errors: list[str], depth: int = 1, counter: list[int] | None = None) -> None:
+def identifier(value: Any) -> bool:
+    return bounded_string(value, 64, allow_empty=False) and all(character.isprintable() for character in value)
+
+
+def enter_ast(path: str, errors: list[str], depth: int, counter: list[int]) -> bool:
+    counter[0] += 1
+    if depth > MAX_AST_DEPTH or counter[0] > MAX_AST_NODES:
+        errors.append(path + ":AST_LIMIT")
+        return False
+    return True
+
+
+def looks_like_binding(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("$")
+
+
+def uses_selected_target_binding(value: Any) -> bool:
+    if isinstance(value, str):
+        return value in ("$target", "$tile", "$owner")
+    if isinstance(value, list):
+        return any(uses_selected_target_binding(item) for item in value)
+    if isinstance(value, dict):
+        return any(uses_selected_target_binding(item) for item in value.values())
+    return False
+
+
+def validate_dynamic_target_selector(value: Any, path: str, errors: list[str]) -> bool:
+    keys = {"kind", "ownership", "visibility", "minDistance", "maxDistance", "maxCandidates"}
+    if not exact_keys(value, keys, path, errors):
+        return False
+    if value["kind"] not in DYNAMIC_TARGET_KINDS or value["ownership"] not in DYNAMIC_TARGET_OWNERSHIPS or value["visibility"] not in DYNAMIC_TARGET_VISIBILITIES:
+        errors.append(path + ":ENUM_INVALID")
+        return False
+    if not all(is_int(value[field]) for field in ("minDistance", "maxDistance", "maxCandidates")):
+        errors.append(path + ":NUMBER_INVALID")
+        return False
+    if not 0 <= value["minDistance"] <= value["maxDistance"] <= MAX_DYNAMIC_TARGET_DISTANCE or not 1 <= value["maxCandidates"] <= MAX_DYNAMIC_TARGET_CANDIDATES:
+        errors.append(path + ":BOUNDS_INVALID")
+    if value["kind"] == "none" and (value["ownership"] != "any" or value["visibility"] != "visible" or value["minDistance"] != 0 or value["maxDistance"] != 0 or value["maxCandidates"] != 16):
+        errors.append(path + ":NONE_DEFAULT_INVALID")
+    if value["kind"] in ("unit", "building") and value["visibility"] != "visible":
+        errors.append(path + ":ENTITY_VISIBILITY_INVALID")
+    return True
+
+
+def number_binding_allowed(op: str, token: str, target_selector: dict[str, Any] | None) -> bool:
+    if target_selector is None or target_selector.get("kind") == "none" or token not in DYNAMIC_BINDING_TOKENS:
+        return False
+    if token == "$actor":
+        return op in ("countUnits", "distance")
+    if token == "$tile":
+        return op in ("countTiles", "distance")
+    if token == "$owner":
+        return target_selector.get("visibility") == "visible" and op in ("countUnits", "countBuildings", "countTiles")
+    return op == "distance" or op == "countUnits" and target_selector.get("kind") == "unit" or op == "countBuildings" and target_selector.get("kind") == "building" or op == "countTiles" and target_selector.get("kind") == "tile"
+
+
+def validate_state_reference(value: Any, path: str, errors: list[str]) -> None:
+    keys = {"scope", "scopeId", "key"}
+    if not exact_keys(value, keys, path, errors):
+        return
+    if value["scope"] not in STATE_SCOPES or not bounded_string(value["scopeId"], 64) or not identifier(value["key"]) or looks_like_binding(value["scopeId"]) or looks_like_binding(value["key"]):
+        errors.append(path + ":VALUE_INVALID")
+
+
+def validate_state_definition(value: Any, path: str, errors: list[str]) -> None:
+    keys = {
+        "scope", "scopeId", "key", "valueType", "koreanName", "iconToken", "colorHex",
+        "initialNumber", "initialBool", "initialSet",
+    }
+    if not exact_keys(value, keys, path, errors):
+        return
+    if value["scope"] not in STATE_SCOPES or value["valueType"] not in STATE_VALUE_TYPES:
+        errors.append(path + ":ENUM_INVALID")
+    if not bounded_string(value["scopeId"], 64) or not identifier(value["key"]):
+        errors.append(path + ":IDENTITY_INVALID")
+    korean_name = value["koreanName"]
+    if not bounded_string(korean_name, 80, allow_empty=False) or not any("가" <= character <= "힣" for character in korean_name):
+        errors.append(path + ":KOREAN_NAME_INVALID")
+    icon = value["iconToken"]
+    if not identifier(icon) or not all(character.isalnum() or character in "-_" for character in icon):
+        errors.append(path + ":ICON_INVALID")
+    if not isinstance(value["colorHex"], str) or re.fullmatch(r"#[0-9A-Fa-f]{6}", value["colorHex"]) is None:
+        errors.append(path + ":COLOR_INVALID")
+    if not is_int(value["initialNumber"]) or not -1_000_000 <= value["initialNumber"] <= 1_000_000 or not isinstance(value["initialBool"], bool):
+        errors.append(path + ":INITIAL_VALUE_INVALID")
+    initial_set = value["initialSet"]
+    if not isinstance(initial_set, list) or len(initial_set) > MAX_STATE_SET_ELEMENTS or not all(identifier(item) for item in initial_set) or len(set(initial_set)) != len(initial_set):
+        errors.append(path + ":INITIAL_SET_INVALID")
+
+
+def validate_number_expression(value: Any, path: str, errors: list[str], depth: int, counter: list[int], target_selector: dict[str, Any] | None = None) -> None:
+    keys = {"op", "constant", "state", "left", "right", "selector", "secondSelector", "action", "recentTurns"}
+    if not exact_keys(value, keys, path, errors) or not enter_ast(path, errors, depth, counter):
+        return
+    op = value["op"]
+    if op not in NUMBER_EXPRESSION_OPS:
+        errors.append(path + ":OP_INVALID")
+    if not is_int(value["constant"]) or not -1_000_000 <= value["constant"] <= 1_000_000:
+        errors.append(path + ":CONSTANT_INVALID")
+    if not bounded_string(value["selector"], 64) or not bounded_string(value["secondSelector"], 64):
+        errors.append(path + ":SELECTOR_INVALID")
+    if looks_like_binding(value["selector"]) and not number_binding_allowed(op, value["selector"], target_selector):
+        errors.append(path + ":BINDING_POSITION_INVALID")
+    if looks_like_binding(value["secondSelector"]) and (op != "distance" or not number_binding_allowed(op, value["secondSelector"], target_selector)):
+        errors.append(path + ":BINDING_POSITION_INVALID")
+    if value["action"] not in COMMAND_TYPES or not is_int(value["recentTurns"]) or not 1 <= value["recentTurns"] <= MAX_RECENT_ACTION_TURNS:
+        errors.append(path + ":RECENT_ACTION_INVALID")
+
+    if value["state"] is not None:
+        validate_state_reference(value["state"], path + ".state", errors)
+    for field in ("left", "right"):
+        child = value[field]
+        if child is not None:
+            validate_number_expression(child, path + "." + field, errors, depth + 1, counter, target_selector)
+
+    if op == "state" and value["state"] is None:
+        errors.append(path + ":STATE_REQUIRED")
+    if op in ("add", "subtract", "multiply", "divide") and (value["left"] is None or value["right"] is None):
+        errors.append(path + ":OPERANDS_REQUIRED")
+    if op == "distance" and (not value["selector"] or not value["secondSelector"]):
+        errors.append(path + ":DISTANCE_SELECTORS_REQUIRED")
+
+
+def validate_predicate_expression(value: Any, path: str, errors: list[str], depth: int, counter: list[int], target_selector: dict[str, Any] | None = None) -> None:
+    keys = {"op", "children", "child", "left", "right", "state", "element"}
+    if not exact_keys(value, keys, path, errors) or not enter_ast(path, errors, depth, counter):
+        return
+    op = value["op"]
+    if op not in PREDICATE_EXPRESSION_OPS:
+        errors.append(path + ":OP_INVALID")
+    children = value["children"]
+    if not isinstance(children, list) or len(children) > MAX_AST_NODES:
+        errors.append(path + ":CHILDREN_INVALID")
+        children = []
+    if not bounded_string(value["element"], 64):
+        errors.append(path + ":ELEMENT_INVALID")
+    if looks_like_binding(value["element"]):
+        errors.append(path + ":BINDING_POSITION_INVALID")
+
+    for index, child in enumerate(children):
+        validate_predicate_expression(child, f"{path}.children[{index}]", errors, depth + 1, counter, target_selector)
+    if value["child"] is not None:
+        validate_predicate_expression(value["child"], path + ".child", errors, depth + 1, counter, target_selector)
+    for field in ("left", "right"):
+        expression = value[field]
+        if expression is not None:
+            validate_number_expression(expression, path + "." + field, errors, depth + 1, counter, target_selector)
+    if value["state"] is not None:
+        validate_state_reference(value["state"], path + ".state", errors)
+
+    if op in ("all", "any") and not children:
+        errors.append(path + ":CHILDREN_REQUIRED")
+    elif op == "not" and value["child"] is None:
+        errors.append(path + ":CHILD_REQUIRED")
+    elif op.startswith("number") and (value["left"] is None or value["right"] is None):
+        errors.append(path + ":NUMBER_OPERANDS_REQUIRED")
+    elif op in ("boolState", "setContains") and value["state"] is None:
+        errors.append(path + ":STATE_REQUIRED")
+    if op == "setContains" and not identifier(value["element"]):
+        errors.append(path + ":SET_ELEMENT_INVALID")
+
+
+def validate_state_mutation(value: Any, path: str, errors: list[str], depth: int, counter: list[int], target_selector: dict[str, Any] | None = None) -> None:
+    keys = {"op", "state", "numberValue", "boolValue", "setValues", "element"}
+    if not exact_keys(value, keys, path, errors) or not enter_ast(path, errors, depth, counter):
+        return
+    op = value["op"]
+    if op not in STATE_MUTATION_OPS:
+        errors.append(path + ":OP_INVALID")
+    validate_state_reference(value["state"], path + ".state", errors)
+    if value["numberValue"] is not None:
+        validate_number_expression(value["numberValue"], path + ".numberValue", errors, depth + 1, counter, target_selector)
+    if not isinstance(value["boolValue"], bool):
+        errors.append(path + ":BOOL_INVALID")
+    set_values = value["setValues"]
+    if not isinstance(set_values, list) or len(set_values) > MAX_STATE_SET_ELEMENTS or not all(identifier(item) for item in set_values) or len(set(set_values)) != len(set_values):
+        errors.append(path + ":SET_VALUES_INVALID")
+    if not bounded_string(value["element"], 64):
+        errors.append(path + ":ELEMENT_INVALID")
+    if looks_like_binding(value["element"]) or isinstance(set_values, list) and any(looks_like_binding(item) for item in set_values):
+        errors.append(path + ":BINDING_POSITION_INVALID")
+    if op == "add" and value["numberValue"] is None:
+        errors.append(path + ":NUMBER_VALUE_REQUIRED")
+    if op in ("setAdd", "setRemove") and not identifier(value["element"]):
+        errors.append(path + ":SET_ELEMENT_INVALID")
+
+
+def validate_condition(condition: Any, path: str, errors: list[str], depth: int = 1, counter: list[int] | None = None, target_selector: dict[str, Any] | None = None) -> None:
     if counter is None:
         counter = [0]
-    keys = {"op", "left", "value", "text", "all"}
-    if not exact_keys(condition, keys, path, errors):
-        return
-    counter[0] += 1
-    if depth > 4 or counter[0] > 256:
-        errors.append(path + ":AST_LIMIT")
+    keys = {"op", "left", "value", "text", "all", "predicate"}
+    if not exact_keys(condition, keys, path, errors) or not enter_ast(path, errors, depth, counter):
         return
     if condition["op"] not in COMPARE_OPS or not bounded_string(condition["left"], 64) or not is_int(condition["value"]) or not bounded_string(condition["text"], 64):
         errors.append(path + ":VALUE_INVALID")
+    op = condition["op"]
+    if op == "hasTag":
+        allowed = condition["left"] == "$actor" and target_selector is not None and target_selector.get("kind") != "none" or condition["left"] == "$target" and target_selector is not None and target_selector.get("kind") == "unit"
+        if looks_like_binding(condition["left"]) and not allowed or looks_like_binding(condition["text"]):
+            errors.append(path + ":BINDING_POSITION_INVALID")
+    elif op == "ownerIs":
+        selector_value = condition["left"] or condition["text"]
+        if looks_like_binding(selector_value) and not (selector_value == "$tile" and target_selector is not None and target_selector.get("kind") != "none"):
+            errors.append(path + ":BINDING_POSITION_INVALID")
+    elif looks_like_binding(condition["left"]) or looks_like_binding(condition["text"]):
+        errors.append(path + ":BINDING_POSITION_INVALID")
     children = condition["all"]
-    if not isinstance(children, list):
+    if not isinstance(children, list) or len(children) > MAX_AST_NODES:
         errors.append(path + ":ALL_REQUIRED")
-        return
+        children = []
     for index, child in enumerate(children):
-        validate_condition(child, f"{path}.all[{index}]", errors, depth + 1, counter)
+        validate_condition(child, f"{path}.all[{index}]", errors, depth + 1, counter, target_selector)
+    if condition["predicate"] is not None:
+        validate_predicate_expression(condition["predicate"], path + ".predicate", errors, depth + 1, counter, target_selector)
 
 
-def validate_effect(effect: Any, path: str, errors: list[str]) -> None:
-    keys = {"type", "resource", "amount", "target", "key", "value", "delay"}
+def validate_effect(effect: Any, path: str, errors: list[str], counter: list[int] | None = None, target_selector: dict[str, Any] | None = None) -> None:
+    keys = {"type", "resource", "amount", "target", "key", "value", "delay", "stateMutation"}
     if not exact_keys(effect, keys, path, errors):
         return
     if effect["type"] not in EFFECT_TYPES or effect["resource"] not in RESOURCE_TYPES:
@@ -455,6 +799,15 @@ def validate_effect(effect: Any, path: str, errors: list[str]) -> None:
         errors.append(path + ":TEXT_INVALID")
     effect_type = effect["type"]
     amount = effect["amount"]
+    if looks_like_binding(effect["key"]) or looks_like_binding(effect["value"]):
+        errors.append(path + ":BINDING_POSITION_INVALID")
+    if looks_like_binding(effect["target"]):
+        binding_allowed = target_selector is not None and target_selector.get("kind") != "none" and (
+            effect_type == "factionSwitch" and effect["target"] == "$target" and target_selector.get("kind") == "unit" or
+            effect_type in ("spawn", "relation") and effect["target"] == "$owner" and target_selector.get("visibility") == "visible"
+        )
+        if not binding_allowed:
+            errors.append(path + ":BINDING_POSITION_INVALID")
     if effect_type == "resource" and (effect["resource"] == "none" or not 1 <= amount <= 1_000):
         errors.append(path + ":RESOURCE_INVALID")
     elif effect_type == "sp" and (amount == 0 or not -10 <= amount <= 10):
@@ -467,6 +820,12 @@ def validate_effect(effect: Any, path: str, errors: list[str]) -> None:
         errors.append(path + ":UNLOCK_INVALID")
     elif effect_type == "schedule" and (effect["key"] not in EVENT_TYPES or effect["resource"] == "none" or not 1 <= amount <= 1_000 or not 1 <= effect["delay"] <= 30):
         errors.append(path + ":SCHEDULE_INVALID")
+    elif effect_type == "factionSwitch" and effect["target"] != "$target" and (not effect["target"].isdigit() or not effect["key"].isdigit()):
+        errors.append(path + ":FACTION_SWITCH_INVALID")
+    if effect["stateMutation"] is not None:
+        validate_state_mutation(effect["stateMutation"], path + ".stateMutation", errors, 2, counter or [0], target_selector)
+    if effect_type == "typedState" and effect["stateMutation"] is None:
+        errors.append(path + ":STATE_MUTATION_REQUIRED")
 
 
 def validate_rule_set_response(value: Any, request_id: str, apply_turn: int) -> list[str]:
@@ -482,7 +841,7 @@ def validate_rule_set_response(value: Any, request_id: str, apply_turn: int) -> 
     if not isinstance(changes, list) or not 1 <= len(changes) <= 3:
         errors.append("changes:COUNT_INVALID")
         changes = []
-    if not isinstance(actions, list) or len(actions) > 16:
+    if not isinstance(actions, list) or len(actions) > MAX_RULESET_ACTIONS:
         errors.append("actions:COUNT_INVALID")
         actions = []
     if not isinstance(contracts, list) or len(contracts) > 3:
@@ -492,7 +851,7 @@ def validate_rule_set_response(value: Any, request_id: str, apply_turn: int) -> 
     seen_rule_ids: set[str] = set()
     for index, rule in enumerate(changes):
         path = f"changes[{index}]"
-        keys = {"id", "name", "description", "trigger", "condition", "effects", "priority", "durationTurns", "appliedTurn", "worldCue"}
+        keys = {"id", "name", "description", "trigger", "condition", "effects", "stateDefinitions", "priority", "durationTurns", "appliedTurn", "worldCue"}
         if not exact_keys(rule, keys, path, errors):
             continue
         if not bounded_string(rule["id"], 64, False) or rule["id"] in seen_rule_ids:
@@ -501,20 +860,33 @@ def validate_rule_set_response(value: Any, request_id: str, apply_turn: int) -> 
             seen_rule_ids.add(rule["id"])
         if not bounded_string(rule["name"], 80, False) or not bounded_string(rule["description"], 600, False) or not bounded_string(rule["worldCue"], 80):
             errors.append(path + ":TEXT_INVALID")
-        if rule["trigger"] not in EVENT_TYPES or not is_int(rule["priority"]) or not is_int(rule["durationTurns"]) or not 1 <= rule["durationTurns"] <= 30 or rule["appliedTurn"] != apply_turn:
+        if rule["trigger"] not in EVENT_TYPES or not is_int(rule["priority"]) or not -1_000 <= rule["priority"] <= 1_000 or not is_int(rule["durationTurns"]) or not 1 <= rule["durationTurns"] <= 30 or rule["appliedTurn"] != apply_turn:
             errors.append(path + ":BOUNDS_INVALID")
-        validate_condition(rule["condition"], path + ".condition", errors)
+        ast_counter = [0]
+        validate_condition(rule["condition"], path + ".condition", errors, counter=ast_counter)
+        definitions = rule["stateDefinitions"]
+        if not isinstance(definitions, list) or len(definitions) > 4:
+            errors.append(path + ":STATE_DEFINITION_COUNT")
+            definitions = []
+        definition_identities: set[tuple[Any, Any, Any]] = set()
+        for definition_index, definition in enumerate(definitions):
+            validate_state_definition(definition, f"{path}.stateDefinitions[{definition_index}]", errors)
+            if isinstance(definition, dict):
+                identity = (definition.get("scope"), definition.get("scopeId"), definition.get("key"))
+                if identity in definition_identities:
+                    errors.append(path + ":STATE_DEFINITION_DUPLICATE")
+                definition_identities.add(identity)
         effects = rule["effects"]
         if not isinstance(effects, list) or not 1 <= len(effects) <= 16:
             errors.append(path + ":EFFECT_COUNT")
         else:
             for effect_index, effect in enumerate(effects):
-                validate_effect(effect, f"{path}.effects[{effect_index}]", errors)
+                validate_effect(effect, f"{path}.effects[{effect_index}]", errors, ast_counter)
 
     seen_action_ids: set[str] = set()
     for index, action in enumerate(actions):
         path = f"actions[{index}]"
-        keys = {"id", "name", "description", "spCost", "resourceCost", "resourceAmount", "cooldown", "availableTurn", "condition", "effects"}
+        keys = {"id", "name", "description", "spCost", "resourceCost", "resourceAmount", "cooldown", "availableTurn", "targetSelector", "condition", "effects"}
         if not exact_keys(action, keys, path, errors):
             continue
         if not bounded_string(action["id"], 64, False) or action["id"] in seen_action_ids:
@@ -526,13 +898,18 @@ def validate_rule_set_response(value: Any, request_id: str, apply_turn: int) -> 
             errors.append(path + ":BOUNDS_INVALID")
         if action["resourceCost"] not in RESOURCE_TYPES or not bounded_string(action["name"], 80, False) or not bounded_string(action["description"], 600, False):
             errors.append(path + ":VALUE_INVALID")
-        validate_condition(action["condition"], path + ".condition", errors)
+        selector_valid = validate_dynamic_target_selector(action["targetSelector"], path + ".targetSelector", errors)
+        target_selector = action["targetSelector"] if selector_valid else None
+        if target_selector is not None and target_selector["kind"] != "none" and not uses_selected_target_binding({"condition": action["condition"], "effects": action["effects"]}):
+            errors.append(path + ":DYNAMIC_TARGET_UNUSED")
+        ast_counter = [0]
+        validate_condition(action["condition"], path + ".condition", errors, counter=ast_counter, target_selector=target_selector)
         effects = action["effects"]
         if not isinstance(effects, list) or not 1 <= len(effects) <= 16:
             errors.append(path + ":EFFECT_COUNT")
         else:
             for effect_index, effect in enumerate(effects):
-                validate_effect(effect, f"{path}.effects[{effect_index}]", errors)
+                validate_effect(effect, f"{path}.effects[{effect_index}]", errors, ast_counter, target_selector)
 
     seen_contract_ids: set[str] = set()
     for index, contract in enumerate(contracts):
@@ -545,22 +922,105 @@ def validate_rule_set_response(value: Any, request_id: str, apply_turn: int) -> 
         else:
             seen_contract_ids.add(contract["id"])
         numbers = ("target", "minimumTurns", "announcedTurn", "achievableFromTurn", "replaceWarningTurn")
-        if not all(is_int(contract[field]) for field in numbers) or contract["target"] <= 0 or not 3 <= contract["minimumTurns"] <= 30:
+        if not all(is_int(contract[field]) for field in numbers) or not 1 <= contract["target"] <= 1_000_000 or not 3 <= contract["minimumTurns"] <= 30 or any(not 0 <= contract[field] <= 1_000_000 for field in ("announcedTurn", "achievableFromTurn", "replaceWarningTurn")):
             errors.append(path + ":BOUNDS_INVALID")
         if contract["progressKey"] not in PROGRESS_KEYS or not bounded_string(contract["title"], 80, False) or not bounded_string(contract["description"], 600, False) or not bounded_string(contract["worldCue"], 80):
             errors.append(path + ":VALUE_INVALID")
     return errors[:20]
 
 
+def canonical_state_reference(reference: dict[str, Any]) -> dict[str, Any]:
+    return {"scope": reference["scope"], "scopeId": reference["scopeId"], "key": reference["key"]}
+
+
+def canonical_state_definition(definition: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "scope": definition["scope"],
+        "scopeId": definition["scopeId"],
+        "key": definition["key"],
+        "valueType": definition["valueType"],
+    }
+    if definition["valueType"] == "number":
+        result["initial"] = definition["initialNumber"]
+    elif definition["valueType"] == "boolean":
+        result["initial"] = definition["initialBool"]
+    else:
+        result["initial"] = sorted(definition["initialSet"])
+    return result
+
+
+def canonical_number_expression(expression: dict[str, Any]) -> dict[str, Any]:
+    op = expression["op"]
+    result: dict[str, Any] = {"op": op}
+    if op == "constant":
+        result["constant"] = expression["constant"]
+    elif op == "state":
+        result["state"] = canonical_state_reference(expression["state"])
+    elif op in ("add", "subtract", "multiply", "divide"):
+        result["left"] = canonical_number_expression(expression["left"])
+        result["right"] = canonical_number_expression(expression["right"])
+    elif op in ("countUnits", "countBuildings", "countTiles"):
+        result["selector"] = expression["selector"]
+    elif op == "distance":
+        result["selector"] = expression["selector"]
+        result["secondSelector"] = expression["secondSelector"]
+    elif op == "recentActionRatio":
+        result["action"] = expression["action"]
+        result["recentTurns"] = expression["recentTurns"]
+    return result
+
+
+def canonical_predicate_expression(predicate: dict[str, Any]) -> dict[str, Any]:
+    op = predicate["op"]
+    result: dict[str, Any] = {"op": op}
+    if op in ("all", "any"):
+        result["children"] = sorted((canonical_predicate_expression(child) for child in predicate["children"]), key=canonical_json)
+    elif op == "not":
+        result["child"] = canonical_predicate_expression(predicate["child"])
+    elif op.startswith("number"):
+        result["left"] = canonical_number_expression(predicate["left"])
+        result["right"] = canonical_number_expression(predicate["right"])
+    elif op == "boolState":
+        result["state"] = canonical_state_reference(predicate["state"])
+    elif op == "setContains":
+        result["state"] = canonical_state_reference(predicate["state"])
+        result["element"] = predicate["element"]
+    return result
+
+
 def canonical_condition(condition: dict[str, Any]) -> dict[str, Any]:
     result = {key: condition[key] for key in ("op", "left", "value", "text")}
     children = [canonical_condition(child) for child in condition.get("all", [])]
     result["all"] = sorted(children, key=canonical_json)
+    result["predicate"] = None if condition["predicate"] is None else canonical_predicate_expression(condition["predicate"])
+    return result
+
+
+def canonical_state_mutation(mutation: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "op": mutation["op"],
+        "state": canonical_state_reference(mutation["state"]),
+    }
+    if mutation["numberValue"] is not None:
+        result["numberValue"] = canonical_number_expression(mutation["numberValue"])
+    if mutation["op"] == "set":
+        result["boolValue"] = mutation["boolValue"]
+        result["setValues"] = sorted(mutation["setValues"])
+    elif mutation["op"] in ("setAdd", "setRemove"):
+        result["element"] = mutation["element"]
     return result
 
 
 def canonical_effect(effect: dict[str, Any]) -> dict[str, Any]:
-    return {key: effect[key] for key in ("type", "resource", "amount", "target", "key", "value", "delay")}
+    result = {key: effect[key] for key in ("type", "resource", "amount", "target", "key", "delay")}
+    result["stateMutation"] = None if effect["stateMutation"] is None else canonical_state_mutation(effect["stateMutation"])
+    return result
+
+
+def canonical_dynamic_target_selector(selector: dict[str, Any]) -> dict[str, Any]:
+    if selector["kind"] == "none":
+        return dynamic_target_selector()
+    return {key: selector[key] for key in ("kind", "ownership", "visibility", "minDistance", "maxDistance", "maxCandidates")}
 
 
 def semantic_graph(rule_set: dict[str, Any]) -> dict[str, Any]:
@@ -570,8 +1030,10 @@ def semantic_graph(rule_set: dict[str, Any]) -> dict[str, Any]:
             "trigger": rule["trigger"],
             "condition": canonical_condition(rule["condition"]),
             "effects": [canonical_effect(effect) for effect in rule["effects"]],
+            "stateDefinitions": sorted((canonical_state_definition(definition) for definition in rule["stateDefinitions"]), key=canonical_json),
             "priority": rule["priority"],
             "durationTurns": rule["durationTurns"],
+            "appliedTurnOffset": rule["appliedTurn"] - apply_turn,
         }
         for rule in rule_set["changes"]
     ]
@@ -582,6 +1044,7 @@ def semantic_graph(rule_set: dict[str, Any]) -> dict[str, Any]:
             "resourceAmount": action["resourceAmount"],
             "cooldown": action["cooldown"],
             "availableTurnOffset": action["availableTurn"] - apply_turn,
+            "targetSelector": canonical_dynamic_target_selector(action["targetSelector"]),
             "condition": canonical_condition(action["condition"]),
             "effects": [canonical_effect(effect) for effect in action["effects"]],
         }
@@ -610,6 +1073,19 @@ def graph_signature(rule_set: dict[str, Any]) -> str:
 
 
 def signature_self_check() -> dict[str, bool]:
+    score_reference = state_reference("run", "score")
+    score_definition = {
+        "scope": "run",
+        "scopeId": "",
+        "key": "score",
+        "valueType": "number",
+        "koreanName": "원정 점수",
+        "iconToken": "score",
+        "colorHex": "#33AAFF",
+        "initialNumber": 1,
+        "initialBool": False,
+        "initialSet": [],
+    }
     sample = {
         "schemaVersion": "v1",
         "requestId": "request-a",
@@ -621,27 +1097,122 @@ def signature_self_check() -> dict[str, bool]:
                 "name": "표시 이름 A",
                 "description": "표시 설명 A",
                 "trigger": "turnStart",
-                "condition": empty_condition(),
-                "effects": [{"type": "resource", "resource": "food", "amount": 1, "target": "", "key": "", "value": "", "delay": 0}],
+                "condition": empty_condition(
+                    predicate=predicate_expression(
+                        "numberGreater",
+                        left=number_expression("state", state=copy.deepcopy(score_reference)),
+                        right=number_expression("constant", constant=0),
+                    )
+                ),
+                "effects": [
+                    {
+                        "type": "typedState",
+                        "resource": "none",
+                        "amount": 0,
+                        "target": "",
+                        "key": "",
+                        "value": "",
+                        "delay": 0,
+                        "stateMutation": state_mutation(
+                            "add",
+                            copy.deepcopy(score_reference),
+                            number_value=number_expression("constant", constant=2),
+                        ),
+                    }
+                ],
+                "stateDefinitions": [score_definition],
                 "priority": 0,
                 "durationTurns": 3,
                 "appliedTurn": 7,
                 "worldCue": "연출 A",
             }
         ],
-        "actions": [],
+        "actions": [
+            {
+                "id": "action-a",
+                "name": "표적 회유",
+                "description": "보이는 비아군 유닛을 선택해 회유합니다.",
+                "spCost": 2,
+                "resourceCost": "none",
+                "resourceAmount": 0,
+                "cooldown": 2,
+                "availableTurn": 7,
+                "targetSelector": dynamic_target_selector("unit", ownership="nonPlayer", min_distance=1, max_distance=4),
+                "condition": empty_condition(
+                    predicate=predicate_expression(
+                        "numberLessOrEqual",
+                        left=number_expression("distance", selector="$actor", second_selector="$target"),
+                        right=number_expression("constant", constant=4),
+                    )
+                ),
+                "effects": [
+                    {
+                        "type": "factionSwitch",
+                        "resource": "none",
+                        "amount": 0,
+                        "target": "$target",
+                        "key": "1",
+                        "value": "",
+                        "delay": 0,
+                        "stateMutation": None,
+                    }
+                ],
+            }
+        ],
         "victoryContracts": [],
     }
     presentation_variant = copy.deepcopy(sample)
     presentation_variant.update(requestId="request-b", koreanSummary="발표 B")
     presentation_variant["changes"][0].update(id="rule-b", name="표시 이름 B", description="표시 설명 B", worldCue="연출 B")
-    semantic_variant = copy.deepcopy(sample)
-    semantic_variant["changes"][0]["effects"][0]["amount"] = 2
+    presentation_variant["changes"][0]["stateDefinitions"][0].update(koreanName="새 원정 점수", iconToken="new_score", colorHex="#FFAA33")
+    presentation_variant["actions"][0].update(id="action-b", name="표시 행동 B", description="표시 행동 설명 B")
+    typed_semantic_variant = copy.deepcopy(sample)
+    typed_semantic_variant["changes"][0]["effects"][0]["stateMutation"]["numberValue"]["constant"] = 3
+    selector_semantic_variant = copy.deepcopy(sample)
+    selector_semantic_variant["actions"][0]["targetSelector"]["maxDistance"] = 5
+    noncanonical_none_selector = dynamic_target_selector(max_candidates=1)
+    none_selector_errors: list[str] = []
+    validate_dynamic_target_selector(noncanonical_none_selector, "noneSelector", none_selector_errors)
+    none_selector_canonical = canonical_dynamic_target_selector(noncanonical_none_selector) == canonical_dynamic_target_selector(dynamic_target_selector())
+    explored_unit_errors: list[str] = []
+    validate_dynamic_target_selector(
+        dynamic_target_selector("unit", visibility="explored"),
+        "exploredUnitSelector",
+        explored_unit_errors,
+    )
+    legacy_variant = copy.deepcopy(sample)
+    del legacy_variant["changes"][0]["stateDefinitions"]
+    legacy_action_variant = copy.deepcopy(sample)
+    del legacy_action_variant["actions"][0]["targetSelector"]
+    excessive_actions_variant = copy.deepcopy(sample)
+    excessive_actions_variant["actions"] = []
+    for action_index in range(MAX_RULESET_ACTIONS + 1):
+        action = copy.deepcopy(sample["actions"][0])
+        action["id"] = f"action-over-cap-{action_index}"
+        excessive_actions_variant["actions"].append(action)
+
+    current_errors = validate_rule_set_response(sample, "request-a", 7)
+    legacy_errors = validate_rule_set_response(legacy_variant, "request-a", 7)
+    legacy_action_errors = validate_rule_set_response(legacy_action_variant, "request-a", 7)
+    excessive_action_errors = validate_rule_set_response(excessive_actions_variant, "request-a", 7)
+    current_contract_accepted = not current_errors
+    legacy_contract_rejected = bool(legacy_errors) and bool(legacy_action_errors)
     presentation_invariant = graph_signature(sample) == graph_signature(presentation_variant)
-    semantic_difference = graph_signature(sample) != graph_signature(semantic_variant)
-    if not presentation_invariant or not semantic_difference:
-        raise EvaluationError("graph signature self-check failed")
-    return {"presentationAndIdInvariant": presentation_invariant, "semanticDifferenceDetected": semantic_difference}
+    typed_semantic_difference = graph_signature(sample) != graph_signature(typed_semantic_variant)
+    selector_semantic_difference = graph_signature(sample) != graph_signature(selector_semantic_variant)
+    excessive_actions_rejected = "actions:COUNT_INVALID" in excessive_action_errors
+    if not current_contract_accepted or not legacy_contract_rejected or not presentation_invariant or not typed_semantic_difference or not selector_semantic_difference or not none_selector_errors or not none_selector_canonical or not explored_unit_errors or not excessive_actions_rejected:
+        raise EvaluationError("rules-v4 contract or graph signature self-check failed")
+    return {
+        "currentStrictResponseAccepted": current_contract_accepted,
+        "legacyContractRejected": legacy_contract_rejected,
+        "presentationAndIdInvariant": presentation_invariant,
+        "typedSemanticDifferenceDetected": typed_semantic_difference,
+        "targetSelectorSemanticDifferenceDetected": selector_semantic_difference,
+        "noneSelectorCanonicalizedAndStrict": bool(none_selector_errors) and none_selector_canonical,
+        "entityExploredVisibilityRejected": bool(explored_unit_errors),
+        "excessiveActionsRejected": excessive_actions_rejected,
+    }
 
 
 def normalize_api_origin(raw: str) -> str:
@@ -739,6 +1310,12 @@ def request_json(
     if status is None or not 200 <= status < 300:
         error_code = safe_error_code(status, parsed_body, error_code or "NETWORK_ERROR")
     return {"status": status, "body": parsed_body, "headers": selected_headers, "elapsedMs": elapsed_ms, "error": error_code}
+
+
+def rule_contract_headers(additional: dict[str, str] | None = None) -> dict[str, str]:
+    headers = {COMPATIBILITY_HEADER: EXPECTED_COMPATIBILITY_VERSION}
+    headers.update(additional or {})
+    return headers
 
 
 def transport_self_check() -> dict[str, str]:
@@ -871,7 +1448,14 @@ def require_health(opener: urllib.request.OpenerDirector, api_origin: str, timeo
 
 
 def issue_session(opener: urllib.request.OpenerDirector, api_origin: str, run_id: str, timeout_seconds: float) -> str:
-    result = request_json(opener, api_origin + "/v1/sessions", "POST", {"runId": run_id}, {}, timeout_seconds)
+    result = request_json(
+        opener,
+        api_origin + "/v1/sessions",
+        "POST",
+        {"runId": run_id},
+        rule_contract_headers(),
+        timeout_seconds,
+    )
     body = result["body"]
     token = body.get("token") if result["status"] == 200 and isinstance(body, dict) else None
     if not isinstance(token, str) or not token:
@@ -1145,11 +1729,11 @@ def run_reserved_evaluation(args: argparse.Namespace, api_origin: str, reservati
             api_origin + "/v1/rules/generate",
             "POST",
             snapshot,
-            {
+            rule_contract_headers({
                 "Authorization": "Bearer " + session_token,
                 "Idempotency-Key": request_id,
                 "X-Unity-Version": "release-evaluator-1.0",
-            },
+            }),
             args.timeout,
         )
         attempts = parse_generation_attempts(result["headers"]["generationAttempts"])
@@ -1259,6 +1843,12 @@ def run_dry() -> int:
     signature_checks = signature_self_check()
     transport_checks = transport_self_check()
     reservation_checks = report_reservation_self_check()
+    contract_headers = rule_contract_headers({"X-Self-Check": "present"})
+    if contract_headers != {
+        COMPATIBILITY_HEADER: EXPECTED_COMPATIBILITY_VERSION,
+        "X-Self-Check": "present",
+    }:
+        raise EvaluationError("request compatibility header self-check failed")
     print(
         canonical_json(
             {
@@ -1267,6 +1857,7 @@ def run_dry() -> int:
                 "dataset": info,
                 "graphSignature": signature_checks,
                 "reportReservation": reservation_checks,
+                "requestContract": {"compatibilityHeader": COMPATIBILITY_HEADER, "exactVersion": True},
                 "transportErrors": transport_checks,
             }
         )

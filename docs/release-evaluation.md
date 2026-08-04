@@ -56,7 +56,7 @@ to report all of the following:
 
 - healthy, configured service and database;
 - `apiVersion: v1`;
-- `compatibilityVersion: rules-v2-strict-2026-08`;
+- `compatibilityVersion: rules-v4-targeting-2026-08`;
 - `limits.perClientDailyAttempts >= 100`;
 - `limits.globalDailyAttempts >= 100`.
 

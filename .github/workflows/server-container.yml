@@ -5,7 +5,9 @@ on:
     branches: [main]
     paths:
       - "Server/**"
-      - "Assets/OnlyMyGame/Core/RuleCore.cs"
+      - "Assets/OnlyMyGame/Core/**/*.cs"
+      - "docker-compose.yml"
+      - "scripts/compute-api-source-hash.py"
       - "scripts/verify-server.sh"
       - ".dockerignore"
       - ".github/workflows/server-container.yml"
@@ -67,6 +69,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute API source identity
+        id: source
+        run: echo "hash=$(python3 scripts/compute-api-source-hash.py)" >> "$GITHUB_OUTPUT"
+
       - name: Generate image metadata
         id: metadata
         uses: docker/metadata-action@v6
@@ -78,6 +84,8 @@ jobs:
           labels: |
             org.opencontainers.image.title=OnlyMyGame API
             org.opencontainers.image.description=Validated runtime rule generation service for OnlyMyGame
+            org.opencontainers.image.revision=${{ github.sha }}
+            io.onlymygame.source-hash=${{ steps.source.outputs.hash }}
 
       - name: Build and publish multi-architecture image
         id: publish

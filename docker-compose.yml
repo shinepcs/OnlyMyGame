@@ -1,11 +1,119 @@
 services:
+  onlymygame-data-init:
+    image: ${ONLYMYGAME_API_IMAGE:?immutable image@sha256 digest is required}
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        umask 077
+        case "$${APP_UID:-}" in
+          ""|*[!0-9]*) echo "APP_UID is missing or invalid." >&2; exit 1 ;;
+        esac
+        [ "$${APP_UID}" -gt 0 ] || { echo "APP_UID must be non-root." >&2; exit 1; }
+        database=/data/onlymygame.db
+        backup=/backup/onlymygame.db
+        check_database() {
+          [ "$(sqlite3 "$${1}" 'PRAGMA temp_store=MEMORY; PRAGMA integrity_check;')" = "ok" ]
+        }
+        restore_metadata() {
+          metadata_file=$${1}
+          metadata_target=$${2}
+          original_metadata=$(cat "$${metadata_file}")
+          original_uid=$${original_metadata%%:*}
+          original_remainder=$${original_metadata#*:}
+          original_gid=$${original_remainder%%:*}
+          original_mode=$${original_remainder#*:}
+          case "$${original_uid}:$${original_gid}" in
+            *[!0-9:]*) echo "Invalid backup ownership metadata." >&2; exit 1 ;;
+          esac
+          [ -n "$${original_uid}" ] && [ -n "$${original_gid}" ]
+          printf '%s\n' "$${original_mode}" | grep -Eq '^[0-7]{3,4}$$'
+          chown "$${original_uid}:$${original_gid}" "$${metadata_target}"
+          chmod "$${original_mode}" "$${metadata_target}"
+        }
+        case "$${ONLYMYGAME_DATA_MODE:-permissions}" in
+          permissions)
+            chown "$${APP_UID}:0" /data
+            chmod 0770 /data
+            for data_file in "$${database}" "$${database}-journal" "$${database}-shm" "$${database}-wal"; do
+              if [ -e "$${data_file}" ]; then
+                chown "$${APP_UID}:0" "$${data_file}"
+                chmod 0660 "$${data_file}"
+              fi
+            done
+            ;;
+          backup)
+            rm -f "$${backup}" "$${backup}.tmp" "$${backup}.sha256" \
+              /backup/data-absent /backup/original-data-mode /backup/original-database-mode
+            stat -c '%u:%g:%a' /data > /backup/original-data-mode
+            chmod 0600 /backup/original-data-mode
+            if [ ! -f "$${database}" ]; then
+              : > /backup/data-absent
+              exit 0
+            fi
+            check_database "$${database}"
+            stat -c '%u:%g:%a' "$${database}" > /backup/original-database-mode
+            sqlite3 "$${database}" ".backup '$${backup}.tmp'"
+            check_database "$${backup}.tmp"
+            mv "$${backup}.tmp" "$${backup}"
+            chmod 0600 "$${backup}"
+            sha256sum "$${backup}" > "$${backup}.sha256"
+            chmod 0600 "$${backup}.sha256" /backup/original-database-mode
+            ;;
+          restore)
+            if [ -f /backup/data-absent ]; then
+              rm -f "$${database}" "$${database}-journal" "$${database}-shm" "$${database}-wal"
+              restore_metadata /backup/original-data-mode /data
+              exit 0
+            fi
+            [ -s "$${backup}" ] && [ -s "$${backup}.sha256" ]
+            sha256sum -c "$${backup}.sha256"
+            check_database "$${backup}"
+            rm -f "$${database}.restore"
+            cp "$${backup}" "$${database}.restore"
+            restore_metadata /backup/original-database-mode "$${database}.restore"
+            rm -f "$${database}-journal" "$${database}-shm" "$${database}-wal"
+            mv "$${database}.restore" "$${database}"
+            check_database "$${database}"
+            restore_metadata /backup/original-data-mode /data
+            ;;
+          verify)
+            check_database "$${database}"
+            ;;
+          *)
+            echo "Unsupported ONLYMYGAME_DATA_MODE." >&2
+            exit 1
+            ;;
+        esac
+    network_mode: none
+    environment:
+      ONLYMYGAME_DATA_MODE: ${ONLYMYGAME_DATA_MODE:-permissions}
+    volumes:
+      - onlymygame-data:/data
+      - type: bind
+        source: ${ONLYMYGAME_BACKUP_DIR:-./.onlymygame-backups}
+        target: /backup
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
   onlymygame-api:
-    build:
-      context: .
-      dockerfile: Server/OnlyMyGame.Api/Dockerfile
+    image: ${ONLYMYGAME_API_IMAGE:?immutable image@sha256 digest is required}
+    depends_on:
+      onlymygame-data-init:
+        condition: service_completed_successfully
     ports: ["127.0.0.1:8080:8080"]
     volumes: ["onlymygame-data:/data"]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     environment:
+      TMPDIR: /tmp
       OPENAI_API_KEY: ${OPENAI_API_KEY:?set in NAS secret or environment}
       ONLYMYGAME_ALLOWED_ORIGIN: ${ONLYMYGAME_ALLOWED_ORIGIN:?GitHub Pages origin}
       ONLYMYGAME_DAILY_SALT: ${ONLYMYGAME_DAILY_SALT:?stable high-entropy hashing secret}

@@ -4,6 +4,7 @@ using System.Linq;
 using OnlyMyGame.Core;
 using UnityEngine;
 using UnityEngine.UI;
+using RuleEventType = OnlyMyGame.Core.EventType;
 
 namespace OnlyMyGame.Runtime
 {
@@ -36,15 +37,19 @@ namespace OnlyMyGame.Runtime
         private readonly List<Button> dynamicActionButtons = new List<Button>();
         private readonly List<Text> dynamicActionLabels = new List<Text>();
         private readonly List<DynamicActionV1> displayedDynamicActions = new List<DynamicActionV1>();
+        private readonly Dictionary<BuildingType, Button> buildTypeButtons = new Dictionary<BuildingType, Button>();
+        private readonly Dictionary<BuildingType, Text> buildTypeLabels = new Dictionary<BuildingType, Text>();
         private GameController controller;
         private Font font;
         private GameObject interfaceRoot;
         private GameObject mainMenu;
         private GameObject pauseMenu;
         private GameObject ledgerPanel;
+        private GameObject buildPickerPanel;
         private GameObject modalPanel;
         private GameObject outcomePanel;
         private Text headline;
+        private Text luckBadge;
         private Text resources;
         private Text objective;
         private Text relations;
@@ -107,6 +112,7 @@ namespace OnlyMyGame.Runtime
             BuildMainMenu();
             BuildPauseMenu();
             BuildLedger();
+            BuildBuildPicker();
             BuildModal();
             BuildOutcome();
             dynamicActionHandler = controller.RunDynamicFromHud;
@@ -118,9 +124,11 @@ namespace OnlyMyGame.Runtime
             var top = PanelObject("TopBar", interfaceRoot.transform, new Color(0.025f, 0.04f, 0.075f, 0.96f));
             Anchor(top, new Vector2(0, 1), new Vector2(1, 1), Vector2.zero, new Vector2(0, 82), new Vector2(0.5f, 1));
             headline = Label("Headline", top.transform, "ONLY MY GAME", 24, Gold, TextAnchor.MiddleLeft, FontStyle.Bold);
-            Anchor(headline.gameObject, new Vector2(0, 0), new Vector2(0, 1), new Vector2(24, 0), new Vector2(300, 0), new Vector2(0, 0.5f));
+            Anchor(headline.gameObject, new Vector2(0, 0), new Vector2(0, 1), new Vector2(24, 0), new Vector2(275, 0), new Vector2(0, 0.5f));
+            luckBadge = Label("LuckBadge", top.transform, "☀  행운 --", 17, Gold, TextAnchor.MiddleCenter, FontStyle.Bold);
+            Anchor(luckBadge.gameObject, new Vector2(0, 0), new Vector2(0, 1), new Vector2(300, 0), new Vector2(142, 0), new Vector2(0, 0.5f));
             resources = Label("Resources", top.transform, string.Empty, 19, Color.white, TextAnchor.MiddleCenter, FontStyle.Normal);
-            Anchor(resources.gameObject, new Vector2(0.18f, 0), new Vector2(0.82f, 1), Vector2.zero, Vector2.zero, new Vector2(0.5f, 0.5f));
+            Anchor(resources.gameObject, new Vector2(0.23f, 0), new Vector2(0.79f, 1), Vector2.zero, Vector2.zero, new Vector2(0.5f, 0.5f));
             service = Label("Service", top.transform, "AI 연결 확인 중", 14, Muted, TextAnchor.MiddleRight, FontStyle.Normal);
             Anchor(service.gameObject, new Vector2(1, 0), new Vector2(1, 1), new Vector2(-248, 0), new Vector2(150, 0), new Vector2(1, 0.5f));
             var help = ButtonObject("Help", top.transform, "도움말", new Color(0.16f, 0.22f, 0.31f, 1), () => ToggleLedger(true));
@@ -194,15 +202,15 @@ namespace OnlyMyGame.Runtime
             {
                 CommandType.Move, CommandType.Gather, CommandType.Hunt,
                 CommandType.Attack, CommandType.Trade, CommandType.Persuade,
-                CommandType.Hire, CommandType.Build, CommandType.Upgrade
+                CommandType.Hire, CommandType.Build, CommandType.Upgrade, CommandType.Capture
             };
             for (var i = 0; i < actions.Length; i++)
             {
                 var command = actions[i];
                 var button = ButtonObject("Action_" + command, parent, ActionLabel(command), ActionColor(command), () => controller.BeginCommand(command));
-                var column = i % 3;
-                var row = i / 3;
-                Anchor(button.gameObject, new Vector2(0, 1), new Vector2(0, 1), new Vector2(18 + column * 114, -184 - row * 66), new Vector2(104, 56), new Vector2(0, 1));
+                var column = i % 4;
+                var row = i / 4;
+                Anchor(button.gameObject, new Vector2(0, 1), new Vector2(0, 1), new Vector2(18 + column * 82, -184 - row * 66), new Vector2(76, 56), new Vector2(0, 1));
                 actionButtons[command] = button;
             }
         }
@@ -311,6 +319,40 @@ namespace OnlyMyGame.Runtime
             ledgerPanel.SetActive(false);
         }
 
+        private void BuildBuildPicker()
+        {
+            buildPickerPanel = PanelObject("BuildPicker", interfaceRoot.transform, new Color(0.01f, 0.02f, 0.04f, 0.86f));
+            Stretch(buildPickerPanel);
+            var card = PanelObject("BuildPickerCard", buildPickerPanel.transform, Ink);
+            Anchor(card, new Vector2(0.5f, 0.5f), new Vector2(0.5f, 0.5f), Vector2.zero, new Vector2(820, 650), new Vector2(0.5f, 0.5f));
+            var title = Label("BuildPickerTitle", card.transform, "건설할 건물을 선택하세요", 30, Gold, TextAnchor.MiddleCenter, FontStyle.Bold);
+            Anchor(title.gameObject, new Vector2(0, 1), new Vector2(1, 1), new Vector2(34, -30), new Vector2(-68, 50), new Vector2(0.5f, 1));
+            var hint = Label("BuildPickerHint", card.transform, "현재 또는 이동 예약 타일에 건설 · SP 3 · 표시 비용은 다른 명령의 예약분을 반영합니다", 15, Muted, TextAnchor.MiddleCenter, FontStyle.Normal);
+            Anchor(hint.gameObject, new Vector2(0, 1), new Vector2(1, 1), new Vector2(34, -86), new Vector2(-68, 34), new Vector2(0.5f, 1));
+
+            var types = controller.BuildTypes;
+            for (var index = 0; index < types.Count; index++)
+            {
+                var type = types[index];
+                var selectedType = type;
+                var column = index % 2;
+                var row = index / 2;
+                var button = ButtonObject("BuildType_" + type, card.transform, string.Empty, new Color(0.16f, 0.26f, 0.34f, 1), () => SelectBuildType(selectedType));
+                Anchor(button.gameObject, new Vector2(0, 1), new Vector2(0, 1), new Vector2(42 + column * 374, -142 - row * 126), new Vector2(362, 108), new Vector2(0, 1));
+                var label = button.GetComponentInChildren<Text>();
+                label.fontSize = 16;
+                label.resizeTextForBestFit = true;
+                label.resizeTextMinSize = 12;
+                label.resizeTextMaxSize = 16;
+                buildTypeButtons[type] = button;
+                buildTypeLabels[type] = label;
+            }
+
+            var cancel = ButtonObject("BuildPickerCancel", card.transform, "취소  [Esc]", new Color(0.25f, 0.3f, 0.38f, 1), HideBuildPicker);
+            Anchor(cancel.gameObject, new Vector2(0.5f, 0), new Vector2(0.5f, 0), new Vector2(0, 24), new Vector2(260, 52), new Vector2(0.5f, 0));
+            buildPickerPanel.SetActive(false);
+        }
+
         private void BuildModal()
         {
             modalPanel = PanelObject("RuleModal", interfaceRoot.transform, new Color(0.01f, 0.02f, 0.04f, 0.84f));
@@ -374,7 +416,9 @@ namespace OnlyMyGame.Runtime
                 return;
             }
 
-            headline.text = "ONLY MY GAME   ·   TURN " + game.turn + "   ·   행운 " + game.luck;
+            headline.text = "ONLY MY GAME   ·   TURN " + game.turn;
+            luckBadge.text = "☀  행운 " + game.luck;
+            luckBadge.color = game.luck >= 70 ? Cyan : game.luck >= 35 ? Gold : Red;
             resources.text = "[식] " + player.resources.food + "    [목] " + player.resources.wood + "    [석] " + player.resources.stone + "    [철] " + player.resources.iron + "    [금] " + player.resources.coin;
             service.text = controller.ServiceStatus;
             service.color = controller.ServiceOnline ? Green : controller.ServiceChecking ? Gold : Red;
@@ -406,6 +450,7 @@ namespace OnlyMyGame.Runtime
             clearButton.interactable = controller.Commands.Count > 0 && !controller.IsBusy;
             endTurnLabel.text = controller.IsBlocked ? "규칙 수신을 재시도하세요" : controller.IsBusy ? "AI가 세계를 다시 쓰는 중…" : controller.Commands.Count == 0 ? "대기하고 턴 종료  [Space]" : "명령 확정 · 턴 종료  [Space]";
             endTurnButton.interactable = !controller.IsBusy && !controller.IsBlocked && game.outcome == RunOutcome.Ongoing;
+            if (buildPickerPanel.activeSelf) RefreshBuildPicker();
 
             if (!mainMenu.activeSelf && controller.IsBlocked)
             {
@@ -417,6 +462,7 @@ namespace OnlyMyGame.Runtime
 
             if (!mainMenu.activeSelf && game.outcome != RunOutcome.Ongoing)
             {
+                HideBuildPicker();
                 outcomePanel.SetActive(true);
                 outcomePanel.transform.SetAsLastSibling();
                 outcomeTitle.text = game.outcome == RunOutcome.Victory ? "원정 성공!" : "원정 종료";
@@ -473,6 +519,7 @@ namespace OnlyMyGame.Runtime
             mainMenuStatus.text = hasSave ? "자동 저장된 원정이 있습니다." : controller.HasPreviousRun ? "이전 원정을 복구하거나 새로 시작할 수 있습니다." : "새 원정을 시작하면 턴마다 자동 저장됩니다.";
             pauseMenu.SetActive(false);
             ledgerPanel.SetActive(false);
+            HideBuildPicker();
             outcomePanel.SetActive(false);
             SetModalMode(ModalMode.None);
             mainMenu.transform.SetAsLastSibling();
@@ -531,7 +578,7 @@ namespace OnlyMyGame.Runtime
 
         private void TogglePause()
         {
-            if (mainMenu.activeSelf || modalMode != ModalMode.None || outcomePanel.activeSelf || ledgerPanel.activeSelf) return;
+            if (mainMenu.activeSelf || modalMode != ModalMode.None || outcomePanel.activeSelf || ledgerPanel.activeSelf || buildPickerPanel.activeSelf) return;
             if (controller.IsBusy)
             {
                 Toast("턴 처리가 끝난 뒤 일시 정지 메뉴를 열 수 있습니다.", Gold);
@@ -543,7 +590,7 @@ namespace OnlyMyGame.Runtime
 
         private void ToggleLedger(bool show)
         {
-            if (show && (mainMenu.activeSelf || modalMode != ModalMode.None || outcomePanel.activeSelf)) return;
+            if (show && (mainMenu.activeSelf || modalMode != ModalMode.None || outcomePanel.activeSelf || buildPickerPanel.activeSelf)) return;
             if (show)
             {
                 ledgerBody.text = BuildLedgerText();
@@ -567,24 +614,27 @@ namespace OnlyMyGame.Runtime
             }
             if (Input.GetKeyDown(KeyCode.Tab))
             {
+                if (buildPickerPanel.activeSelf) return;
                 if (ledgerPanel.activeSelf) ToggleLedger(false);
                 else ToggleLedger(true);
             }
             if (Input.GetKeyDown(KeyCode.Escape))
             {
-                if (ledgerPanel.activeSelf) ToggleLedger(false);
+                if (buildPickerPanel.activeSelf) HideBuildPicker();
+                else if (ledgerPanel.activeSelf) ToggleLedger(false);
                 else if (modalMode == ModalMode.RuleAnnouncement) DismissRuleAnnouncement();
                 else if (modalMode == ModalMode.NewRunConfirmation) CancelModal();
                 else if (modalMode == ModalMode.Blocked || mainMenu.activeSelf || outcomePanel.activeSelf) return;
                 else if (controller.IsTargeting) controller.CancelTargeting();
                 else TogglePause();
             }
-            if (Input.GetKeyDown(KeyCode.Space) && endTurnButton.interactable && !mainMenu.activeSelf && !pauseMenu.activeSelf && !ledgerPanel.activeSelf && modalMode == ModalMode.None && !outcomePanel.activeSelf)
+            if (Input.GetKeyDown(KeyCode.Space) && endTurnButton.interactable && !mainMenu.activeSelf && !pauseMenu.activeSelf && !ledgerPanel.activeSelf && !buildPickerPanel.activeSelf && modalMode == ModalMode.None && !outcomePanel.activeSelf)
                 controller.EndTurnFromHud();
         }
 
         private void RenderUnavailableState()
         {
+            HideBuildPicker();
             headline.text = "ONLY MY GAME   ·   원정 준비 중";
             resources.text = "원정 데이터를 불러오고 있습니다.";
             objective.text = "잠시만 기다려 주세요.";
@@ -635,8 +685,12 @@ namespace OnlyMyGame.Runtime
             else
             {
                 var extra = Math.Max(0, source.Count - DynamicActionSlotCount);
-                dynamicActionSummary.text = "규칙이 만든 행동 " + source.Count + "개" + (extra > 0 ? " · 장부에 " + extra + "개 더 표시" : " · 비용과 재사용 턴을 확인하세요");
+                dynamicActionSummary.text = "규칙이 만든 행동 " + source.Count + "개" + (extra > 0 ? " · 장부에 " + extra + "개 더 표시" : " · 대상 행동은 아군 선택 후 월드에서 지정하세요");
             }
+
+            var renderAvailability = dynamicActionHandler != null && controller != null
+                ? controller.CanRunDynamicsForHud(displayedDynamicActions)
+                : new List<bool>();
 
             for (var i = 0; i < dynamicActionButtons.Count; i++)
             {
@@ -646,7 +700,12 @@ namespace OnlyMyGame.Runtime
 
                 var action = displayedDynamicActions[i];
                 string reason;
-                var ready = CanUseDynamicAction(action, game, player, out reason);
+                var ready = CanUseDynamicAction(
+                    action,
+                    game,
+                    player,
+                    i < renderAvailability.Count ? (bool?)renderAvailability[i] : null,
+                    out reason);
                 dynamicActionLabels[i].text = SafeText(action.name, "이름 없는 특수 행동") + "\n" + DynamicActionCost(action) + (ready ? " · 사용 가능" : " · " + reason);
                 dynamicActionLabels[i].color = ready ? Color.white : Muted;
                 dynamicActionButtons[i].interactable = ready;
@@ -659,7 +718,7 @@ namespace OnlyMyGame.Runtime
             var game = controller.Game;
             var player = (game.factions ?? new List<FactionState>()).FirstOrDefault(f => f != null && (f.id == 1 || f.kind == FactionKind.Player));
             var reason = "플레이어 원정대 정보를 찾을 수 없습니다.";
-            if (player == null || !CanUseDynamicAction(displayedDynamicActions[slot], game, player, out reason))
+            if (player == null || !CanUseDynamicAction(displayedDynamicActions[slot], game, player, null, out reason))
             {
                 Toast(string.IsNullOrWhiteSpace(reason) ? "이 특수 행동을 지금 사용할 수 없습니다." : reason, Gold);
                 return;
@@ -669,14 +728,19 @@ namespace OnlyMyGame.Runtime
             Render();
         }
 
-        private bool CanUseDynamicAction(DynamicActionV1 action, GameSnapshotV1 game, FactionState player, out string reason)
+        private bool CanUseDynamicAction(
+            DynamicActionV1 action,
+            GameSnapshotV1 game,
+            FactionState player,
+            bool? precomputedCanRun,
+            out string reason)
         {
             if (dynamicActionHandler == null)
             {
                 reason = "실행 연결 대기";
                 return false;
             }
-            if (controller.CanRunDynamic(action))
+            if (precomputedCanRun ?? controller.CanRunDynamic(action))
             {
                 reason = string.Empty;
                 return true;
@@ -702,6 +766,12 @@ namespace OnlyMyGame.Runtime
                 reason = ResourceName(action.resourceCost) + " 부족";
                 return false;
             }
+            if (DynamicActionTargeting.RequiresTarget(action))
+            {
+                var actor = controller.SelectedUnit;
+                reason = actor == null || actor.factionId != 1 ? "아군 유닛 선택 필요" : "시야·거리 내 유효 대상 없음";
+                return false;
+            }
             reason = "조건 또는 효과 확인 필요";
             return false;
         }
@@ -712,6 +782,7 @@ namespace OnlyMyGame.Runtime
             if (game == null) return "원정 규칙을 불러오는 중입니다.";
 
             var sections = new List<string>();
+            var contracts = game.victoryContracts ?? new List<VictoryContractV1>();
             var ruleSource = game.activeRules ?? new List<RuleNodeV1>();
             var ruleEntries = ruleSource.Where(rule => rule != null)
                 .OrderByDescending(rule => rule.appliedTurn)
@@ -723,13 +794,17 @@ namespace OnlyMyGame.Runtime
                         ? "예고 · " + rule.appliedTurn + "턴부터"
                         : GameRules.IsRuleActive(rule, game.turn) ? "활성 · " + RemainingTurns(rule, game.turn) + "턴 남음" : "종료";
                     return "◆ " + SafeText(rule.name, "이름 없는 규칙") + "   [" + status + "]\n" +
-                           "발생/영향: " + SafeText(rule.worldCue, "세계 전체") + "\n" +
-                           "조건: " + ConditionText(rule.condition) + "\n" +
-                           "효과: " + SafeText(rule.description, "효과 설명 없음");
+                           "발생 원인: " + TriggerText(rule.trigger) + "\n" +
+                           "새 조건: " + ConditionText(rule.condition) + "\n" +
+                           "논리 상태: " + StateDefinitionsText(rule.stateDefinitions, game) + "\n" +
+                           "효과 설명: " + SafeText(rule.description, "효과 설명 없음") + "\n" +
+                           "실행식: " + EffectsText(rule.effects) + "\n" +
+                           "지속 시간: " + Math.Max(1, rule.durationTurns) + "턴\n" +
+                           "승리 조건 영향: " + VictoryImpactText(rule, contracts) + "\n" +
+                           "월드 표식: " + SafeText(rule.worldCue, "영향 대상에 범용 표식");
                 }).ToList();
             sections.Add("<color=#FFD05A><b>세계 규칙</b></color>\n" + (ruleEntries.Count == 0 ? "현재 기록된 규칙이 없습니다." : string.Join("\n\n", ruleEntries)));
 
-            var contracts = game.victoryContracts ?? new List<VictoryContractV1>();
             var start = Math.Max(0, contracts.Count - 3);
             var contractEntries = contracts.Skip(start).Where(contract => contract != null).Select(contract =>
                 "★ " + SafeText(contract.title, "이름 없는 승리 계약") + "   " + GameRules.Progress(game, contract.progressKey) + "/" + contract.target + "\n" +
@@ -750,6 +825,7 @@ namespace OnlyMyGame.Runtime
         private void SetModalMode(ModalMode mode)
         {
             modalMode = mode;
+            if (mode != ModalMode.None) HideBuildPicker();
             if (modalRetryButton != null) modalRetryButton.gameObject.SetActive(mode == ModalMode.Blocked);
             if (modalSaveButton != null) modalSaveButton.gameObject.SetActive(mode == ModalMode.Blocked);
             if (modalAcceptButton != null)
@@ -790,6 +866,39 @@ namespace OnlyMyGame.Runtime
             if (modalMode == ModalMode.NewRunConfirmation) SetModalMode(ModalMode.None);
         }
 
+        public void ShowBuildPicker()
+        {
+            if (!initialized || controller == null || buildPickerPanel == null) return;
+            RefreshBuildPicker();
+            buildPickerPanel.SetActive(true);
+            buildPickerPanel.transform.SetAsLastSibling();
+        }
+
+        private void RefreshBuildPicker()
+        {
+            if (controller == null) return;
+            foreach (var type in controller.BuildTypes)
+            {
+                if (!buildTypeButtons.TryGetValue(type, out var button) || !buildTypeLabels.TryGetValue(type, out var label)) continue;
+                var ironCost = GameRules.BuildingIronCost(type);
+                var affordable = controller.CanBuildType(type);
+                label.text = controller.BuildingName(type) + "\n" + controller.BuildingBenefit(type, 1) + "\n목재 " + GameRules.BuildingCost(type) + (ironCost > 0 ? " · 철 " + ironCost : string.Empty) + (affordable ? " · 건설 가능" : " · 현재 선택 불가");
+                label.color = affordable ? Color.white : Muted;
+                button.interactable = affordable;
+            }
+        }
+
+        private void SelectBuildType(BuildingType type)
+        {
+            if (controller != null && controller.QueueBuildFromHud(type)) HideBuildPicker();
+            else RefreshBuildPicker();
+        }
+
+        private void HideBuildPicker()
+        {
+            if (buildPickerPanel != null) buildPickerPanel.SetActive(false);
+        }
+
         private void ReturnFromOutcomeToMenu()
         {
             outcomePanel.SetActive(false);
@@ -805,21 +914,238 @@ namespace OnlyMyGame.Runtime
         private static int RemainingTurns(RuleNodeV1 rule, int turn) => Math.Max(0, rule.appliedTurn + Math.Max(1, rule.durationTurns) - turn);
         private static string ConditionText(ConditionNode condition)
         {
-            if (condition == null || condition.op == CompareOp.Always) return "항상";
-            if (condition.op == CompareOp.HasTag) return "아군 태그: " + SafeText(condition.text, "지정 태그");
-            if (condition.op == CompareOp.OwnerIs) return "보이는 타일 소유 세력 = " + condition.value;
-            var comparison = condition.op == CompareOp.Equal ? "=" : condition.op == CompareOp.GreaterOrEqual ? "이상" : "이하";
-            return SafeText(condition.text, SafeText(condition.left, "상태") + " " + condition.value + " " + comparison);
+            var visited = 0;
+            return ConditionText(condition, 1, ref visited);
         }
-        private static string DynamicActionCost(DynamicActionV1 action) => "SP " + Math.Max(0, action.spCost) + (action.resourceAmount > 0 ? " · " + ResourceName(action.resourceCost) + " " + action.resourceAmount : string.Empty);
+
+        private static string ConditionText(ConditionNode condition, int depth, ref int visited)
+        {
+            if (condition == null) return "항상";
+            if (depth > RuleLimits.MaxConditionDepth || visited++ >= RuleLimits.MaxConditionNodes) return "검증 한도 내 복합 조건";
+
+            string primary;
+            if (condition.predicate != null) primary = PredicateText(condition.predicate, depth + 1, ref visited);
+            else if (condition.op == CompareOp.Always) primary = "항상";
+            else if (condition.op == CompareOp.HasTag)
+            {
+                primary = SelectorText(condition.left) + "에 ‘" + SafeText(condition.text, "지정 태그") + "’ 태그가 있음";
+            }
+            else if (condition.op == CompareOp.OwnerIs)
+            {
+                var selector = string.IsNullOrWhiteSpace(condition.left) ? condition.text : condition.left;
+                primary = TileSelectorText(selector) + "의 소유 세력 = " + condition.value;
+            }
+            else
+            {
+                var comparison = condition.op == CompareOp.Equal ? "=" : condition.op == CompareOp.GreaterOrEqual ? "≥" : "≤";
+                primary = SafeText(condition.text, SafeText(condition.left, "상태") + " " + comparison + " " + condition.value);
+            }
+
+            var children = new List<string>();
+            foreach (var child in condition.all ?? new List<ConditionNode>())
+            {
+                if (child != null) children.Add(ConditionText(child, depth + 1, ref visited));
+            }
+            return children.Count == 0 ? primary : "(" + primary + " AND " + string.Join(" AND ", children) + ")";
+        }
+
+        private static string PredicateText(PredicateExpressionV1 predicate, int depth, ref int visited)
+        {
+            if (predicate == null) return "식 없음";
+            if (depth > RuleLimits.MaxConditionDepth || visited++ >= RuleLimits.MaxConditionNodes) return "검증 한도 내 논리식";
+            if (predicate.op == PredicateExpressionOp.All || predicate.op == PredicateExpressionOp.Any)
+            {
+                var joiner = predicate.op == PredicateExpressionOp.All ? " AND " : " OR ";
+                var children = new List<string>();
+                foreach (var child in predicate.children ?? new List<PredicateExpressionV1>())
+                    children.Add(PredicateText(child, depth + 1, ref visited));
+                return children.Count == 0 ? "조건 없음" : "(" + string.Join(joiner, children) + ")";
+            }
+            if (predicate.op == PredicateExpressionOp.Not) return "NOT (" + PredicateText(predicate.child, depth + 1, ref visited) + ")";
+            if (predicate.op == PredicateExpressionOp.BoolState) return StateReferenceText(predicate.state) + " = 참";
+            if (predicate.op == PredicateExpressionOp.SetContains) return StateReferenceText(predicate.state) + "에 ‘" + SafeText(predicate.element, "값") + "’ 포함";
+            var comparison = predicate.op == PredicateExpressionOp.NumberEqual ? "=" :
+                predicate.op == PredicateExpressionOp.NumberNotEqual ? "≠" :
+                predicate.op == PredicateExpressionOp.NumberGreater ? ">" :
+                predicate.op == PredicateExpressionOp.NumberGreaterOrEqual ? "≥" :
+                predicate.op == PredicateExpressionOp.NumberLess ? "<" : "≤";
+            return NumberExpressionText(predicate.left, depth + 1, ref visited) + " " + comparison + " " + NumberExpressionText(predicate.right, depth + 1, ref visited);
+        }
+
+        private static string NumberExpressionText(NumberExpressionV1 expression, int depth, ref int visited)
+        {
+            if (expression == null) return "값 없음";
+            if (depth > RuleLimits.MaxConditionDepth || visited++ >= RuleLimits.MaxConditionNodes) return "제한된 계산식";
+            if (expression.op == NumberExpressionOp.Constant) return expression.constant.ToString();
+            if (expression.op == NumberExpressionOp.State) return StateReferenceText(expression.state);
+            if (expression.op == NumberExpressionOp.Add || expression.op == NumberExpressionOp.Subtract || expression.op == NumberExpressionOp.Multiply || expression.op == NumberExpressionOp.Divide)
+            {
+                var symbol = expression.op == NumberExpressionOp.Add ? "+" : expression.op == NumberExpressionOp.Subtract ? "−" : expression.op == NumberExpressionOp.Multiply ? "×" : "÷";
+                return "(" + NumberExpressionText(expression.left, depth + 1, ref visited) + " " + symbol + " " + NumberExpressionText(expression.right, depth + 1, ref visited) + ")";
+            }
+            if (expression.op == NumberExpressionOp.CountUnits) return "유닛 수[" + SafeText(expression.selector, "전체") + "]";
+            if (expression.op == NumberExpressionOp.CountBuildings) return "건물 수[" + SafeText(expression.selector, "전체") + "]";
+            if (expression.op == NumberExpressionOp.CountTiles) return "타일 수[" + SafeText(expression.selector, "전체") + "]";
+            if (expression.op == NumberExpressionOp.Distance) return "거리(" + SafeText(expression.selector, "대상 A") + ", " + SafeText(expression.secondSelector, "대상 B") + ")";
+            return "최근 " + Math.Max(1, expression.recentTurns) + "턴 " + GameController.CommandKorean(expression.action) + " 비율";
+        }
+
+        private static string StateDefinitionsText(IEnumerable<StateDefinitionV1> definitions, GameSnapshotV1 game)
+        {
+            var entries = (definitions ?? Enumerable.Empty<StateDefinitionV1>())
+                .Where(definition => definition != null)
+                .Take(8)
+                .Select(definition =>
+                {
+                    var current = (game?.typedRuleState ?? new List<TypedRuleStateEntryV1>())
+                        .FirstOrDefault(entry => entry != null && entry.scope == definition.scope &&
+                                                 string.Equals(entry.key, definition.key, StringComparison.Ordinal) &&
+                                                 string.Equals(NormalizeScopeId(entry.scope, entry.scopeId), NormalizeScopeId(definition.scope, definition.scopeId), StringComparison.Ordinal) &&
+                                                 (entry.scope != RuleStateScope.Turn || entry.stateTurn == game.turn));
+                    var value = StateValueText(definition, current);
+                    var token = SafeText(definition.iconToken, "state");
+                    var label = "◈ " + SafeText(definition.koreanName, definition.key) + " [" + token + "] = " + value + " · " + StateScopeText(definition.scope, definition.scopeId);
+                    return IsSafeColor(definition.colorHex) ? "<color=" + definition.colorHex + ">" + label + "</color>" : label;
+                })
+                .ToList();
+            return entries.Count == 0 ? "추가 상태 없음" : string.Join(" / ", entries);
+        }
+
+        private static string StateValueText(StateDefinitionV1 definition, TypedRuleStateEntryV1 current)
+        {
+            if (definition.valueType == RuleStateValueType.Number) return (current == null ? definition.initialNumber : current.numberValue).ToString();
+            if (definition.valueType == RuleStateValueType.Boolean) return (current == null ? definition.initialBool : current.boolValue) ? "참" : "거짓";
+            var values = current?.setValue ?? definition.initialSet ?? new List<string>();
+            return values.Count == 0 ? "{}" : "{" + string.Join(", ", values.Take(6).Select(value => SafeText(value, "값"))) + (values.Count > 6 ? ", …" : string.Empty) + "}";
+        }
+
+        private static string StateScopeText(RuleStateScope scope, string scopeId)
+        {
+            var name = scope == RuleStateScope.Run ? "원정" : scope == RuleStateScope.Turn ? "턴" : scope == RuleStateScope.Faction ? "세력" : scope == RuleStateScope.Unit ? "유닛" : scope == RuleStateScope.Building ? "건물" : "타일";
+            return string.IsNullOrWhiteSpace(scopeId) ? name : name + " " + SafeText(scopeId, "대상");
+        }
+
+        private static string StateReferenceText(StateReferenceV1 reference)
+        {
+            if (reference == null) return "상태 없음";
+            return StateScopeText(reference.scope, reference.scopeId) + "의 " + SafeText(reference.key, "상태");
+        }
+
+        private static string EffectsText(IEnumerable<EffectNode> effects)
+        {
+            var entries = (effects ?? Enumerable.Empty<EffectNode>()).Where(effect => effect != null).Take(RuleLimits.MaxEffectsPerRule).Select(EffectText).ToList();
+            return entries.Count == 0 ? "효과 없음" : string.Join(" → ", entries);
+        }
+
+        private static string EffectText(EffectNode effect)
+        {
+            if (effect.type == EffectType.TypedState) return MutationText(effect.stateMutation);
+            if (effect.type == EffectType.Resource) return ResourceName(effect.resource) + " " + Signed(effect.amount);
+            if (effect.type == EffectType.Sp) return "SP " + Signed(effect.amount);
+            if (effect.type == EffectType.Relation) return "관계 " + Signed(effect.amount) + " [" + SafeText(effect.target, "대상 세력") + "]";
+            if (effect.type == EffectType.Status) return "상태 " + SafeText(effect.key, "효과") + " = " + effect.amount;
+            if (effect.type == EffectType.Spawn) return SafeText(effect.target, "세력") + " 유닛 " + Math.Max(0, effect.amount) + " 생성";
+            if (effect.type == EffectType.UnlockAction) return "특수 행동 ‘" + SafeText(effect.key, "새 행동") + "’ 해금";
+            if (effect.type == EffectType.Schedule) return Math.Max(0, effect.delay) + "턴 뒤 " + SafeText(effect.key, "예약 이벤트");
+            return "유닛 " + SafeText(effect.target, "대상") + "의 세력을 " + SafeText(effect.key, "새 세력") + "로 변경";
+        }
+
+        private static string MutationText(StateMutationV1 mutation)
+        {
+            if (mutation == null) return "유효하지 않은 상태 효과";
+            var target = StateReferenceText(mutation.state);
+            if (mutation.op == StateMutationOp.Toggle) return target + " 반전";
+            if (mutation.op == StateMutationOp.SetAdd) return target + "에 ‘" + SafeText(mutation.element, "값") + "’ 추가";
+            if (mutation.op == StateMutationOp.SetRemove) return target + "에서 ‘" + SafeText(mutation.element, "값") + "’ 제거";
+            if (mutation.setValues != null && mutation.setValues.Count > 0) return target + " = {" + string.Join(", ", mutation.setValues.Take(6).Select(value => SafeText(value, "값"))) + "}";
+            if (mutation.numberValue != null)
+            {
+                var visited = 0;
+                return target + (mutation.op == StateMutationOp.Add ? " += " : " = ") + NumberExpressionText(mutation.numberValue, 1, ref visited);
+            }
+            return target + " = " + (mutation.boolValue ? "참" : "거짓");
+        }
+
+        private static string NormalizeScopeId(RuleStateScope scope, string scopeId)
+        {
+            if (scope == RuleStateScope.Run || scope == RuleStateScope.Turn) return string.Empty;
+            if (scope == RuleStateScope.Faction && string.Equals(scopeId, "player", StringComparison.OrdinalIgnoreCase)) return "faction:1";
+            return (scopeId ?? string.Empty).ToLowerInvariant();
+        }
+
+        private static bool IsSafeColor(string color)
+        {
+            return color != null && color.Length == 7 && color[0] == '#' && color.Skip(1).All(Uri.IsHexDigit);
+        }
+
+        private static string Signed(int value) => value > 0 ? "+" + value : value.ToString();
+
+        private static string TriggerText(RuleEventType trigger)
+        {
+            if (trigger == RuleEventType.TurnStart) return "턴 시작";
+            if (trigger == RuleEventType.TurnEnd) return "턴 종료";
+            if (trigger == RuleEventType.Move) return "유닛 이동";
+            if (trigger == RuleEventType.Attack) return "공격";
+            if (trigger == RuleEventType.Kill) return "처치";
+            if (trigger == RuleEventType.Gather) return "채집 또는 수렵";
+            if (trigger == RuleEventType.Build) return "건설 또는 강화";
+            if (trigger == RuleEventType.Trade) return "거래";
+            if (trigger == RuleEventType.RelationChanged) return "세력 관계 변화";
+            if (trigger == RuleEventType.Capture) return "점령 성공";
+            return trigger == RuleEventType.TileEntered ? "타일 진입" : SafeText(trigger.ToString(), "세계 상태 변화");
+        }
+
+        private static string VictoryImpactText(RuleNodeV1 rule, IEnumerable<VictoryContractV1> contracts)
+        {
+            var affectedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var effect in rule.effects ?? new List<EffectNode>())
+            {
+                if (effect == null) continue;
+                if (effect.type == EffectType.Resource && effect.resource == ResourceType.Coin) affectedKeys.Add("coin");
+                if (effect.type == EffectType.Relation) affectedKeys.Add("alliances");
+                if (effect.type == EffectType.Spawn || effect.type == EffectType.FactionSwitch) affectedKeys.Add("territory");
+            }
+            if (rule.trigger == RuleEventType.Kill) affectedKeys.Add("kills");
+            if (rule.trigger == RuleEventType.Build) { affectedKeys.Add("build"); affectedKeys.Add("buildings"); }
+            if (rule.trigger == RuleEventType.Move) affectedKeys.Add("move");
+            if (rule.trigger == RuleEventType.Trade) affectedKeys.Add("trade");
+
+            var titles = (contracts ?? Enumerable.Empty<VictoryContractV1>())
+                .Where(contract => contract != null && affectedKeys.Contains(contract.progressKey ?? string.Empty))
+                .Select(contract => SafeText(contract.title, "승리 계약"))
+                .Distinct()
+                .Take(3)
+                .ToList();
+            return titles.Count == 0 ? "현재 계약에 직접 연결되지 않음" : string.Join(", ", titles) + " 진행에 영향 가능";
+        }
+
+        private static string SelectorText(string selector)
+        {
+            if (string.IsNullOrWhiteSpace(selector) || string.Equals(selector, "any", StringComparison.OrdinalIgnoreCase)) return "모든 살아있는 유닛";
+            if (string.Equals(selector, "player", StringComparison.OrdinalIgnoreCase)) return "아군 유닛";
+            if (selector.StartsWith("unit:", StringComparison.OrdinalIgnoreCase)) return "유닛 " + SafeText(selector.Substring(5), "지정 대상");
+            if (selector.StartsWith("faction:", StringComparison.OrdinalIgnoreCase)) return "세력 " + SafeText(selector.Substring(8), "지정 세력") + " 유닛";
+            return SafeText(selector, "지정 대상");
+        }
+
+        private static string TileSelectorText(string selector)
+        {
+            if (string.IsNullOrWhiteSpace(selector) || string.Equals(selector, "any", StringComparison.OrdinalIgnoreCase)) return "지도 타일 중 하나";
+            if (string.Equals(selector, "player_tile", StringComparison.OrdinalIgnoreCase)) return "대표 아군이 있는 타일";
+            return SafeText(selector, "지정 타일");
+        }
+        private static string DynamicActionCost(DynamicActionV1 action) =>
+            "SP " + Math.Max(0, action.spCost) +
+            (action.resourceAmount > 0 ? " · " + ResourceName(action.resourceCost) + " " + action.resourceAmount : string.Empty) +
+            (DynamicActionTargeting.RequiresTarget(action) ? " · " + DynamicActionTargeting.DescribeSelector(action.targetSelector) : string.Empty);
         private static string ResourceName(ResourceType type) => type == ResourceType.Food ? "식량" : type == ResourceType.Wood ? "목재" : type == ResourceType.Stone ? "석재" : type == ResourceType.Iron ? "철" : type == ResourceType.Coin ? "화폐" : "자원";
         private static string SafeText(string value, string fallback)
         {
             var text = string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
             return text.Replace('<', '＜').Replace('>', '＞');
         }
-        private static string ActionLabel(CommandType type) => type == CommandType.Move ? "이동\nSP 1" : type == CommandType.Gather ? "채집\nSP 2" : type == CommandType.Hunt ? "수렵\nSP 2" : type == CommandType.Attack ? "공격\nSP 2" : type == CommandType.Trade ? "거래\nSP 2" : type == CommandType.Persuade ? "설득\nSP 2" : type == CommandType.Hire ? "고용\nSP 2" : type == CommandType.Build ? "건설\nSP 3" : "강화\nSP 3";
-        private static Color ActionColor(CommandType type) => type == CommandType.Attack ? new Color(0.58f, 0.2f, 0.22f, 1) : type == CommandType.Move ? new Color(0.12f, 0.42f, 0.58f, 1) : type == CommandType.Trade || type == CommandType.Persuade || type == CommandType.Hire ? new Color(0.45f, 0.34f, 0.16f, 1) : new Color(0.2f, 0.4f, 0.27f, 1);
+        private static string ActionLabel(CommandType type) => type == CommandType.Move ? "이동\nSP 1" : type == CommandType.Gather ? "채집\nSP 2" : type == CommandType.Hunt ? "수렵\nSP 2" : type == CommandType.Attack ? "공격\nSP 2" : type == CommandType.Trade ? "거래\nSP 2" : type == CommandType.Persuade ? "설득\nSP 2" : type == CommandType.Hire ? "고용\nSP 2" : type == CommandType.Build ? "건설\nSP 3" : type == CommandType.Capture ? "점령\nSP 2" : "강화\nSP 3";
+        private static Color ActionColor(CommandType type) => type == CommandType.Attack ? new Color(0.58f, 0.2f, 0.22f, 1) : type == CommandType.Move || type == CommandType.Capture ? new Color(0.12f, 0.42f, 0.58f, 1) : type == CommandType.Trade || type == CommandType.Persuade || type == CommandType.Hire ? new Color(0.45f, 0.34f, 0.16f, 1) : new Color(0.2f, 0.4f, 0.27f, 1);
 
         private void SectionHeader(Transform parent, string text, Color color, int size)
         {

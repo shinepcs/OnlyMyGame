@@ -85,10 +85,15 @@ namespace OnlyMyGame.Runtime
             var go = new GameObject("FeedbackBurst");
             go.transform.position = position;
             var particles = go.AddComponent<ParticleSystem>();
+            // A newly added ParticleSystem starts immediately because playOnAwake is
+            // enabled by default. Duration and other structural settings may only be
+            // changed while fully stopped, otherwise Unity raises a runtime Assert.
+            particles.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
             var particleRenderer = go.GetComponent<ParticleSystemRenderer>();
             var shader = Shader.Find("Universal Render Pipeline/Particles/Unlit") ?? Shader.Find("Particles/Standard Unlit");
             if (particleRenderer != null && shader != null) particleRenderer.material = new Material(shader);
             var main = particles.main;
+            main.playOnAwake = false;
             main.duration = 0.2f;
             main.loop = false;
             main.startLifetime = 0.45f;
@@ -102,6 +107,7 @@ namespace OnlyMyGame.Runtime
             var shape = particles.shape;
             shape.shapeType = ParticleSystemShapeType.Sphere;
             shape.radius = 0.16f;
+            particles.Play(true);
             particles.Emit(count);
             Destroy(go, 1.2f);
         }

@@ -82,7 +82,8 @@ public static class ApiPolicies
 {
     public const string ProductionWebOrigin = "https://shinepcs.github.io";
     public const string ApiVersion = "v1";
-    public const string RuleCompatibilityVersion = "rules-v2-strict-2026-08";
+    public const string RuleCompatibilityVersion = "rules-v4-targeting-2026-08";
+    public const string RuleCompatibilityHeader = "X-Rules-Compatibility";
     public static readonly TimeSpan RequestLeaseDuration = TimeSpan.FromSeconds(90);
 
     public static string ComputeRuleRequestHash(GameSnapshotV1 snapshot)
@@ -97,6 +98,8 @@ public static class ApiPolicies
             snapshot.luck,
             snapshot.playerKills,
             snapshot.outcome,
+            snapshot.phase,
+            snapshot.planningPrepared,
             snapshot.completedContractId,
             snapshot.map,
             snapshot.entities,
@@ -107,11 +110,65 @@ public static class ApiPolicies
             snapshot.victoryContracts,
             snapshot.dynamicActions,
             snapshot.ruleState,
+            snapshot.typedRuleState,
+            snapshot.recentActionStats,
             snapshot.catalogHash
         };
         var options = new JsonSerializerOptions { IncludeFields = true };
         var json = JsonSerializer.Serialize(canonicalGameplayState, options);
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(json)));
+    }
+
+    public static GameSnapshotV1 BuildPublicRuleDesignerSnapshot(GameSnapshotV1 snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var map = snapshot.map ?? new List<TileState>();
+        var visiblePositions = new HashSet<HexCoord>(map.Where(tile => tile != null && tile.visible).Select(tile => tile.position));
+        var publicMap = map.Where(tile => tile != null).Select(tile =>
+        {
+            var worldDetailsAreCurrent = tile.visible || tile.owner == 1;
+            return new TileState
+            {
+                position = tile.position,
+                terrain = tile.explored ? tile.terrain : "미탐사",
+                resource = tile.explored ? tile.resource : ResourceType.None,
+                amount = worldDetailsAreCurrent ? tile.amount : 0,
+                owner = worldDetailsAreCurrent ? tile.owner : 0,
+                explored = tile.explored,
+                visible = tile.visible
+            };
+        }).ToList();
+
+        return new GameSnapshotV1
+        {
+            runId = snapshot.runId,
+            turn = snapshot.turn,
+            seed = snapshot.seed,
+            luck = snapshot.luck,
+            playerKills = snapshot.playerKills,
+            outcome = snapshot.outcome,
+            phase = snapshot.phase,
+            completedContractId = snapshot.completedContractId,
+            planningPrepared = snapshot.planningPrepared,
+            map = publicMap,
+            entities = (snapshot.entities ?? new List<UnitState>())
+                .Where(unit => unit != null && (unit.factionId == 1 || visiblePositions.Contains(unit.position)))
+                .ToList(),
+            buildings = (snapshot.buildings ?? new List<BuildingState>())
+                .Where(building => building != null && (building.factionId == 1 || visiblePositions.Contains(building.position)))
+                .ToList(),
+            factions = snapshot.factions ?? new List<FactionState>(),
+            actionStats = snapshot.actionStats ?? new List<ActionStat>(),
+            activeRules = snapshot.activeRules ?? new List<RuleNodeV1>(),
+            victoryContracts = snapshot.victoryContracts ?? new List<VictoryContractV1>(),
+            dynamicActions = snapshot.dynamicActions ?? new List<DynamicActionV1>(),
+            ruleState = snapshot.ruleState ?? new List<RuleStateEntry>(),
+            typedRuleState = snapshot.typedRuleState ?? new List<TypedRuleStateEntryV1>(),
+            recentActionStats = snapshot.recentActionStats ?? new List<ActionTurnStatV1>(),
+            ruleBudget = snapshot.ruleBudget ?? new RuleRuntimeBudget(),
+            journal = snapshot.journal ?? new List<string>(),
+            catalogHash = snapshot.catalogHash
+        };
     }
 
     public static void EnsureRequestLogSchema(SqliteConnection database)
@@ -153,11 +210,40 @@ public static class ApiPolicies
         AddColumnIfMissing(database, transaction, columns, "upstream_attempts", "INTEGER NOT NULL DEFAULT 0");
         AddColumnIfMissing(database, transaction, columns, "validation_failures", "INTEGER NOT NULL DEFAULT 0");
         using (var attempts = new SqliteCommand(
-            "CREATE TABLE IF NOT EXISTS request_attempt (id INTEGER PRIMARY KEY, day TEXT NOT NULL, ip_hash TEXT NOT NULL, request_key TEXT NOT NULL, created_utc TEXT NOT NULL); CREATE INDEX IF NOT EXISTS ix_request_attempt_daily_quota ON request_attempt(day, ip_hash); CREATE INDEX IF NOT EXISTS ix_request_attempt_retention ON request_attempt(created_utc);",
+            "CREATE TABLE IF NOT EXISTS request_attempt (id INTEGER PRIMARY KEY, day TEXT NOT NULL, ip_hash TEXT NOT NULL, request_key TEXT NOT NULL, created_utc TEXT NOT NULL, lease_token TEXT, completed_utc TEXT, latency_ms INTEGER, valid INTEGER, error TEXT, response_json TEXT, request_hash TEXT, compatibility_version TEXT, input_tokens INTEGER, output_tokens INTEGER, total_tokens INTEGER, cached_input_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, upstream_attempts INTEGER NOT NULL DEFAULT 0, validation_failures INTEGER NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS ix_request_attempt_daily_quota ON request_attempt(day, ip_hash); CREATE INDEX IF NOT EXISTS ix_request_attempt_retention ON request_attempt(created_utc);",
             database,
             transaction))
         {
             attempts.ExecuteNonQuery();
+        }
+        var attemptColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var attemptPragma = new SqliteCommand("PRAGMA table_info(request_attempt)", database, transaction))
+        using (var reader = attemptPragma.ExecuteReader())
+        {
+            while (reader.Read()) attemptColumns.Add(reader.GetString(1));
+        }
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "lease_token", "TEXT");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "completed_utc", "TEXT");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "latency_ms", "INTEGER");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "valid", "INTEGER");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "error", "TEXT");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "response_json", "TEXT");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "request_hash", "TEXT");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "compatibility_version", "TEXT");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "input_tokens", "INTEGER");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "output_tokens", "INTEGER");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "total_tokens", "INTEGER");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "cached_input_tokens", "INTEGER");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "cache_write_tokens", "INTEGER");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "reasoning_tokens", "INTEGER");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "upstream_attempts", "INTEGER NOT NULL DEFAULT 0");
+        AddAttemptColumnIfMissing(database, transaction, attemptColumns, "validation_failures", "INTEGER NOT NULL DEFAULT 0");
+        using (var attemptIndexes = new SqliteCommand(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_request_attempt_lease ON request_attempt(lease_token) WHERE lease_token IS NOT NULL; CREATE INDEX IF NOT EXISTS ix_request_attempt_audit_retention ON request_attempt(completed_utc, created_utc);",
+            database,
+            transaction))
+        {
+            attemptIndexes.ExecuteNonQuery();
         }
         using (var sessions = new SqliteCommand(
             "CREATE TABLE IF NOT EXISTS game_session (token_hash TEXT PRIMARY KEY, run_id TEXT NOT NULL, ip_hash TEXT NOT NULL, created_utc TEXT NOT NULL, expires_utc TEXT NOT NULL); CREATE INDEX IF NOT EXISTS ix_game_session_active_ip ON game_session(ip_hash, expires_utc); CREATE INDEX IF NOT EXISTS ix_game_session_expiration ON game_session(expires_utc);",
@@ -256,7 +342,7 @@ public static class ApiPolicies
 
         int attemptsDeleted;
         using (var pruneAttempts = new SqliteCommand(
-            "DELETE FROM request_attempt WHERE created_utc < $cutoff",
+            "DELETE FROM request_attempt WHERE COALESCE(completed_utc, created_utc) < $cutoff",
             database,
             transaction))
         {
@@ -490,7 +576,7 @@ public static class ApiPolicies
         }
 
         using (var recordAttempt = new SqliteCommand(
-            "INSERT INTO request_attempt(day,ip_hash,request_key,created_utc) VALUES($day,$ip,$key,$utc)",
+            "INSERT INTO request_attempt(day,ip_hash,request_key,created_utc,lease_token,request_hash,compatibility_version) VALUES($day,$ip,$key,$utc,$lease,$hash,$compat)",
             database,
             transaction))
         {
@@ -498,6 +584,9 @@ public static class ApiPolicies
             recordAttempt.Parameters.AddWithValue("$ip", ipHash);
             recordAttempt.Parameters.AddWithValue("$key", requestKey);
             recordAttempt.Parameters.AddWithValue("$utc", nowText);
+            recordAttempt.Parameters.AddWithValue("$lease", leaseToken);
+            recordAttempt.Parameters.AddWithValue("$hash", requestHash);
+            recordAttempt.Parameters.AddWithValue("$compat", RuleCompatibilityVersion);
             recordAttempt.ExecuteNonQuery();
         }
 
@@ -523,6 +612,54 @@ public static class ApiPolicies
         DateTime? completedUtc = null)
     {
         var succeeded = string.IsNullOrWhiteSpace(error) && !string.IsNullOrWhiteSpace(responseJson);
+        var latency = Math.Max(0, latencyMilliseconds);
+        var completed = (completedUtc ?? DateTime.UtcNow).ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
+        using var transaction = database.BeginTransaction(deferred: false);
+        var auditRecorded = false;
+        using (var audit = new SqliteCommand(
+            """
+            UPDATE request_attempt SET
+                completed_utc=$completed,
+                latency_ms=$latency,
+                valid=$valid,
+                error=$error,
+                response_json=$response,
+                input_tokens=$input,
+                output_tokens=$output,
+                total_tokens=$total,
+                cached_input_tokens=$cached,
+                cache_write_tokens=$cacheWrite,
+                reasoning_tokens=$reasoning,
+                upstream_attempts=$upstreamAttempts,
+                validation_failures=$validationFailures
+            WHERE request_key=$key AND lease_token=$lease AND valid IS NULL
+            """,
+            database,
+            transaction))
+        {
+            audit.Parameters.AddWithValue("$completed", completed);
+            audit.Parameters.AddWithValue("$latency", latency);
+            audit.Parameters.AddWithValue("$valid", succeeded ? 1 : 0);
+            audit.Parameters.AddWithValue("$error", succeeded ? string.Empty : (error ?? "INTERNAL_ERROR"));
+            audit.Parameters.AddWithValue("$response", succeeded ? responseJson! : DBNull.Value);
+            audit.Parameters.AddWithValue("$input", usage?.InputTokens is long auditInput ? auditInput : DBNull.Value);
+            audit.Parameters.AddWithValue("$output", usage?.OutputTokens is long auditOutput ? auditOutput : DBNull.Value);
+            audit.Parameters.AddWithValue("$total", usage?.TotalTokens is long auditTotal ? auditTotal : DBNull.Value);
+            audit.Parameters.AddWithValue("$cached", usage?.CachedInputTokens is long auditCached ? auditCached : DBNull.Value);
+            audit.Parameters.AddWithValue("$cacheWrite", usage?.CacheWriteTokens is long auditCacheWrite ? auditCacheWrite : DBNull.Value);
+            audit.Parameters.AddWithValue("$reasoning", usage?.ReasoningTokens is long auditReasoning ? auditReasoning : DBNull.Value);
+            audit.Parameters.AddWithValue("$upstreamAttempts", Math.Max(0, upstreamAttempts));
+            audit.Parameters.AddWithValue("$validationFailures", Math.Max(0, validationFailures));
+            audit.Parameters.AddWithValue("$key", requestKey);
+            audit.Parameters.AddWithValue("$lease", leaseToken);
+            auditRecorded = audit.ExecuteNonQuery() == 1;
+        }
+        if (!auditRecorded)
+        {
+            transaction.Rollback();
+            return false;
+        }
+
         using var update = new SqliteCommand(
             """
             UPDATE request_log SET
@@ -543,9 +680,9 @@ public static class ApiPolicies
                 validation_failures=COALESCE(validation_failures,0)+$validationFailures
             WHERE request_key=$key AND lease_token=$lease AND valid IS NULL
             """,
-            database);
-        var latency = Math.Max(0, latencyMilliseconds);
-        update.Parameters.AddWithValue("$completed", (completedUtc ?? DateTime.UtcNow).ToUniversalTime().ToString("O", CultureInfo.InvariantCulture));
+            database,
+            transaction);
+        update.Parameters.AddWithValue("$completed", completed);
         update.Parameters.AddWithValue("$latency", latency);
         update.Parameters.AddWithValue("$valid", succeeded ? 1 : 0);
         update.Parameters.AddWithValue("$error", succeeded ? string.Empty : (error ?? "INTERNAL_ERROR"));
@@ -560,7 +697,9 @@ public static class ApiPolicies
         update.Parameters.AddWithValue("$validationFailures", Math.Max(0, validationFailures));
         update.Parameters.AddWithValue("$key", requestKey);
         update.Parameters.AddWithValue("$lease", leaseToken);
-        return update.ExecuteNonQuery() == 1;
+        var accepted = update.ExecuteNonQuery() == 1;
+        transaction.Commit();
+        return accepted;
     }
 
     public static void InvalidateStoredResponse(SqliteConnection database, string requestKey)
@@ -672,14 +811,30 @@ public static class ApiPolicies
 
     public static IPAddress[] ParseTrustedProxies(string? configuredProxies)
     {
-        if (string.IsNullOrWhiteSpace(configuredProxies)) return Array.Empty<IPAddress>();
-        return configuredProxies
-            .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(candidate => IPAddress.TryParse(candidate, out var address) ? address : null)
-            .Where(address => address != null)
-            .Cast<IPAddress>()
-            .Distinct()
-            .ToArray();
+        return TryParseTrustedProxies(configuredProxies, out var proxies)
+            ? proxies
+            : Array.Empty<IPAddress>();
+    }
+
+    public static bool TryParseTrustedProxies(string? configuredProxies, out IPAddress[] proxies)
+    {
+        proxies = Array.Empty<IPAddress>();
+        if (string.IsNullOrWhiteSpace(configuredProxies)) return true;
+
+        var candidates = configuredProxies.Split(
+            new[] { ',', ';' },
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (candidates.Length == 0) return false;
+
+        var parsed = new List<IPAddress>(candidates.Length);
+        foreach (var candidate in candidates)
+        {
+            if (!IPAddress.TryParse(candidate, out var address)) return false;
+            parsed.Add(address);
+        }
+
+        proxies = parsed.Distinct().ToArray();
+        return proxies.Length > 0;
     }
 
     public static IReadOnlyList<string> ValidateSnapshot(GameSnapshotV1? snapshot)
@@ -693,6 +848,10 @@ public static class ApiPolicies
 
         if (string.IsNullOrWhiteSpace(snapshot.runId) || snapshot.runId.Length > 128) errors.Add("RUN_ID_REQUIRED");
         if (snapshot.turn < 0 || snapshot.turn > 1_000_000) errors.Add("TURN_OUT_OF_RANGE");
+        if (!Enum.IsDefined(typeof(RunOutcome), snapshot.outcome)) errors.Add("OUTCOME_INVALID");
+        if (!Enum.IsDefined(typeof(RunPhase), snapshot.phase)) errors.Add("PHASE_INVALID");
+        if (snapshot.outcome != RunOutcome.Ongoing || snapshot.phase != RunPhase.AwaitingRules || snapshot.planningPrepared)
+            errors.Add("RULE_GENERATION_LIFECYCLE_INVALID");
         if (string.IsNullOrWhiteSpace(snapshot.catalogHash) || snapshot.catalogHash.Length > 128) errors.Add("CATALOG_HASH_REQUIRED");
         ValidateCollection(snapshot.map, 1, 4_096, "MAP", errors);
         ValidateCollection(snapshot.entities, 0, 1_024, "ENTITIES", errors);
@@ -701,8 +860,10 @@ public static class ApiPolicies
         ValidateCollection(snapshot.actionStats, 0, 64, "ACTION_STATS", errors);
         ValidateCollection(snapshot.activeRules, 0, RuleLimits.MaxStoredRules, "ACTIVE_RULES", errors);
         ValidateCollection(snapshot.victoryContracts, 0, 3, "VICTORY_CONTRACTS", errors);
-        ValidateCollection(snapshot.dynamicActions, 0, 64, "DYNAMIC_ACTIONS", errors);
-        ValidateCollection(snapshot.ruleState, 0, 512, "RULE_STATE", errors);
+        ValidateCollection(snapshot.dynamicActions, 0, RuleLimits.MaxDynamicActions, "DYNAMIC_ACTIONS", errors);
+        ValidateCollection(snapshot.ruleState, 0, RuleLimits.MaxStateVariables, "RULE_STATE", errors);
+        ValidateCollection(snapshot.typedRuleState, 0, RuleLimits.MaxStateVariables, "TYPED_RULE_STATE", errors);
+        ValidateCollection(snapshot.recentActionStats, 0, RuleLimits.MaxRecentActionEntries, "RECENT_ACTION_STATS", errors);
         ValidateCollection(snapshot.journal, 0, 512, "JOURNAL", errors);
         if (snapshot.factions != null && !snapshot.factions.Any(faction => faction != null && faction.kind == FactionKind.Player))
             errors.Add("PLAYER_FACTION_REQUIRED");
@@ -722,7 +883,7 @@ public static class ApiPolicies
         if (string.IsNullOrWhiteSpace(ruleSet.requestId) || ruleSet.requestId.Length > 128) errors.Add("REQUEST_ID_INVALID");
         if (string.IsNullOrWhiteSpace(ruleSet.koreanSummary) || ruleSet.koreanSummary.Length > 2_000) errors.Add("SUMMARY_INVALID");
         ValidateCollection(ruleSet.changes, 1, 3, "CHANGES", errors);
-        ValidateCollection(ruleSet.actions, 0, 16, "ACTIONS", errors);
+        ValidateCollection(ruleSet.actions, 0, RuleLimits.MaxDynamicActionsPerRuleSet, "ACTIONS", errors);
         ValidateCollection(ruleSet.victoryContracts, 0, 3, "VICTORY_CONTRACTS", errors);
 
         foreach (var rule in ruleSet.changes ?? new List<RuleNodeV1>())
@@ -917,6 +1078,19 @@ public static class ApiPolicies
     {
         if (columns.Contains(name)) return;
         using var alter = new SqliteCommand($"ALTER TABLE request_log ADD COLUMN {name} {type}", database, transaction);
+        alter.ExecuteNonQuery();
+        columns.Add(name);
+    }
+
+    private static void AddAttemptColumnIfMissing(
+        SqliteConnection database,
+        SqliteTransaction transaction,
+        ISet<string> columns,
+        string name,
+        string type)
+    {
+        if (columns.Contains(name)) return;
+        using var alter = new SqliteCommand($"ALTER TABLE request_attempt ADD COLUMN {name} {type}", database, transaction);
         alter.ExecuteNonQuery();
         columns.Add(name);
     }

@@ -16,6 +16,8 @@ Assets/OnlyMyGame/*
 !Assets/OnlyMyGame/Core/
 Assets/OnlyMyGame/Core/*
 !Assets/OnlyMyGame/Core/RuleCore.cs
+!Assets/OnlyMyGame/Core/RuleExpressions.cs
+!Assets/OnlyMyGame/Core/DynamicActionTargeting.cs
 apikey.txt
 sshpw.txt
 .env

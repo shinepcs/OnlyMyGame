@@ -58,6 +58,7 @@ public sealed class ApiEndpointTests : IAsyncLifetime
         startInfo.Environment["ONLYMYGAME_DAILY_SALT"] = "test-salt";
         startInfo.Environment["ONLYMYGAME_DAILY_LIMIT"] = "1";
         startInfo.Environment["ONLYMYGAME_UPSTREAM_TIMEOUT_SECONDS"] = "1";
+        startInfo.Environment["ONLYMYGAME_READINESS_CACHE_SECONDS"] = "1";
         startInfo.Environment["ONLYMYGAME_TRUSTED_PROXIES"] = "127.0.0.1,::1,::ffff:127.0.0.1";
         startInfo.Environment["ONLYMYGAME_OPENAI_BASE_URL"] = $"http://127.0.0.1:{upstreamPort}/";
 
@@ -67,6 +68,7 @@ public sealed class ApiEndpointTests : IAsyncLifetime
         apiProcess.BeginOutputReadLine();
         apiProcess.BeginErrorReadLine();
         client = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{port}") };
+        client.DefaultRequestHeaders.TryAddWithoutValidation(ApiPolicies.RuleCompatibilityHeader, ApiPolicies.RuleCompatibilityVersion);
 
         for (var attempt = 0; attempt < 50; attempt++)
         {
@@ -93,7 +95,7 @@ public sealed class ApiEndpointTests : IAsyncLifetime
         using var request = new HttpRequestMessage(HttpMethod.Options, "/v1/rules/generate");
         request.Headers.TryAddWithoutValidation("Origin", "https://shinepcs.github.io");
         request.Headers.TryAddWithoutValidation("Access-Control-Request-Method", "POST");
-        request.Headers.TryAddWithoutValidation("Access-Control-Request-Headers", "content-type,idempotency-key,x-unity-version");
+        request.Headers.TryAddWithoutValidation("Access-Control-Request-Headers", "content-type,idempotency-key,x-unity-version,x-rules-compatibility");
 
         using var response = await Client.SendAsync(request);
 
@@ -103,6 +105,7 @@ public sealed class ApiEndpointTests : IAsyncLifetime
         Assert.Contains("idempotency-key", response.Headers.GetValues("Access-Control-Allow-Headers").Single(), StringComparison.OrdinalIgnoreCase);
         Assert.Contains("authorization", response.Headers.GetValues("Access-Control-Allow-Headers").Single(), StringComparison.OrdinalIgnoreCase);
         Assert.Contains("x-unity-version", response.Headers.GetValues("Access-Control-Allow-Headers").Single(), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("x-rules-compatibility", response.Headers.GetValues("Access-Control-Allow-Headers").Single(), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -116,6 +119,172 @@ public sealed class ApiEndpointTests : IAsyncLifetime
         Assert.Contains("\"configured\":true", payload, StringComparison.Ordinal);
         Assert.Contains(ApiPolicies.RuleCompatibilityVersion, payload, StringComparison.Ordinal);
         Assert.Contains("\"retentionDays\":30", payload, StringComparison.Ordinal);
+        await using var database = new SqliteConnection("Data Source=" + Path.Combine(temporaryDirectory, "api.db"));
+        await database.OpenAsync();
+        await using var probeRows = new SqliteCommand(
+            "SELECT COUNT(*) FROM service_maintenance WHERE name='__onlymygame_readiness_probe__'",
+            database);
+        Assert.Equal(0L, (long)(await probeRows.ExecuteScalarAsync() ?? 0L));
+    }
+
+    [Fact]
+    public async Task RuleEndpoints_RejectMissingOrMismatchedCompatibilityContract()
+    {
+        using var incompatibleClient = new HttpClient { BaseAddress = Client.BaseAddress };
+        using (var missingSession = new HttpRequestMessage(HttpMethod.Post, "/v1/sessions")
+        {
+            Content = JsonContent.Create(new { runId = "missing-contract" })
+        })
+        using (var response = await incompatibleClient.SendAsync(missingSession))
+        {
+            var payload = await response.Content.ReadAsStringAsync();
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            Assert.Contains("RULE_COMPATIBILITY_MISMATCH", payload, StringComparison.Ordinal);
+            Assert.Contains(ApiPolicies.RuleCompatibilityVersion, payload, StringComparison.Ordinal);
+        }
+
+        using (var mismatchedSession = new HttpRequestMessage(HttpMethod.Post, "/v1/sessions")
+        {
+            Content = JsonContent.Create(new { runId = "mismatched-contract" })
+        })
+        {
+            mismatchedSession.Headers.TryAddWithoutValidation(ApiPolicies.RuleCompatibilityHeader, "rules-v3-legacy");
+            using var response = await incompatibleClient.SendAsync(mismatchedSession);
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        }
+
+        const string forwardedClientIp = "198.51.100.94";
+        var snapshot = ValidSnapshot("missing-generation-contract");
+        var token = await IssueSessionAsync(snapshot.runId, forwardedClientIp);
+        using var generation = new HttpRequestMessage(HttpMethod.Post, "/v1/rules/generate")
+        {
+            Content = new StringContent(JsonSerializer.Serialize(snapshot, FieldJsonOptions()), Encoding.UTF8, "application/json")
+        };
+        generation.Headers.TryAddWithoutValidation("Idempotency-Key", "missing-generation-contract-key");
+        generation.Headers.TryAddWithoutValidation("X-Forwarded-For", forwardedClientIp);
+        generation.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        using var generationResponse = await incompatibleClient.SendAsync(generation);
+        Assert.Equal(HttpStatusCode.Conflict, generationResponse.StatusCode);
+        Assert.Equal(0, Volatile.Read(ref upstreamRequestCount));
+    }
+
+    [Fact]
+    public async Task ReadinessRequiresDatabaseWriteWhileLivenessRemainsAvailable()
+    {
+        await Task.Delay(1_200);
+        using (var prime = await Client.GetAsync("/health"))
+            Assert.Equal(HttpStatusCode.OK, prime.StatusCode);
+        await using var database = new SqliteConnection("Data Source=" + Path.Combine(temporaryDirectory, "api.db"));
+        await database.OpenAsync();
+        await using var writeLock = database.BeginTransaction(deferred: false);
+
+        using (var cachedReadiness = await Client.GetAsync("/health"))
+            Assert.Equal(HttpStatusCode.OK, cachedReadiness.StatusCode);
+        await Task.Delay(1_200);
+        using (var readiness = await Client.GetAsync("/health"))
+        {
+            var payload = await readiness.Content.ReadAsStringAsync();
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, readiness.StatusCode);
+            Assert.Contains("\"database\":\"unavailable\"", payload, StringComparison.Ordinal);
+            Assert.Contains("\"configured\":true", payload, StringComparison.Ordinal);
+        }
+        using (var liveness = await Client.GetAsync("/live"))
+        {
+            var payload = await liveness.Content.ReadAsStringAsync();
+            Assert.Equal(HttpStatusCode.OK, liveness.StatusCode);
+            Assert.Contains("\"status\":\"ok\"", payload, StringComparison.Ordinal);
+            Assert.Contains(ApiPolicies.RuleCompatibilityVersion, payload, StringComparison.Ordinal);
+        }
+
+        await writeLock.RollbackAsync();
+        await Task.Delay(1_200);
+        using var recovered = await Client.GetAsync("/health");
+        var recoveredPayload = await recovered.Content.ReadAsStringAsync();
+        Assert.True(recovered.StatusCode == HttpStatusCode.OK, recoveredPayload + "\n" + ReadOutput());
+    }
+
+    [Fact]
+    public async Task InvalidTrustedProxyConfiguration_MakesHealthAndSessionsFailClosed()
+    {
+        var port = FindFreeTcpPort();
+        var apiAssembly = Path.GetFullPath(
+            "../../../../OnlyMyGame.Api/bin/Release/net8.0/OnlyMyGame.Api.dll",
+            AppContext.BaseDirectory);
+        var invalidOutput = new StringBuilder();
+        var startInfo = new ProcessStartInfo("dotnet", '"' + apiAssembly + '"')
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        startInfo.Environment["DOTNET_ROLL_FORWARD"] = "Major";
+        startInfo.Environment["ASPNETCORE_ENVIRONMENT"] = "Production";
+        startInfo.Environment["ASPNETCORE_URLS"] = $"http://127.0.0.1:{port}";
+        startInfo.Environment["ONLYMYGAME_DB"] = Path.Combine(temporaryDirectory, "invalid-proxy.db");
+        startInfo.Environment["OPENAI_API_KEY"] = "test-key";
+        startInfo.Environment["ONLYMYGAME_DAILY_SALT"] = "test-salt";
+        startInfo.Environment["ONLYMYGAME_TRUSTED_PROXIES"] = "not-an-ip";
+
+        using var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException("Could not start the invalid-proxy API process.");
+        process.OutputDataReceived += (_, args) => { if (args.Data != null) invalidOutput.AppendLine(args.Data); };
+        process.ErrorDataReceived += (_, args) => { if (args.Data != null) invalidOutput.AppendLine(args.Data); };
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+            using var invalidClient = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{port}") };
+            invalidClient.DefaultRequestHeaders.TryAddWithoutValidation(ApiPolicies.RuleCompatibilityHeader, ApiPolicies.RuleCompatibilityVersion);
+        HttpResponseMessage? healthResponse = null;
+        try
+        {
+            for (var attempt = 0; attempt < 50; attempt++)
+            {
+                if (process.HasExited)
+                    throw new InvalidOperationException("Invalid-proxy API exited during startup.\n" + invalidOutput);
+                try
+                {
+                    healthResponse = await invalidClient.GetAsync("/health");
+                    break;
+                }
+                catch (HttpRequestException)
+                {
+                    await Task.Delay(100);
+                }
+            }
+
+            Assert.NotNull(healthResponse);
+            using (healthResponse)
+            {
+                var payload = await healthResponse!.Content.ReadAsStringAsync();
+                Assert.Equal(HttpStatusCode.ServiceUnavailable, healthResponse.StatusCode);
+                Assert.Contains("\"status\":\"unavailable\"", payload, StringComparison.Ordinal);
+                Assert.Contains("\"configured\":false", payload, StringComparison.Ordinal);
+            }
+            using (var liveness = await invalidClient.GetAsync("/live"))
+            {
+                var payload = await liveness.Content.ReadAsStringAsync();
+                Assert.Equal(HttpStatusCode.OK, liveness.StatusCode);
+                Assert.Contains("\"status\":\"ok\"", payload, StringComparison.Ordinal);
+            }
+
+            using var sessionRequest = new HttpRequestMessage(HttpMethod.Post, "/v1/sessions")
+            {
+                Content = JsonContent.Create(new { runId = "invalid-proxy-run" })
+            };
+            using var sessionResponse = await invalidClient.SendAsync(sessionRequest);
+            var sessionPayload = await sessionResponse.Content.ReadAsStringAsync();
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, sessionResponse.StatusCode);
+            Assert.Contains("SERVICE_NOT_CONFIGURED", sessionPayload, StringComparison.Ordinal);
+        }
+        finally
+        {
+            healthResponse?.Dispose();
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit(5_000);
+            }
+        }
     }
 
     [Fact]
@@ -163,7 +332,44 @@ public sealed class ApiEndpointTests : IAsyncLifetime
         Assert.Equal("2", response.Headers.GetValues("X-OnlyMyGame-Generation-Attempts").Single());
         Assert.StartsWith("total;dur=", response.Headers.GetValues("Server-Timing").Single(), StringComparison.Ordinal);
         Assert.Equal(2, Volatile.Read(ref upstreamRequestCount));
-        Assert.Contains("UPSTREAM_INVALID_JSON", upstreamRequestBodies.ElementAt(1), StringComparison.Ordinal);
+        var repairedRequestBody = upstreamRequestBodies.ElementAt(1);
+        Assert.Contains("UPSTREAM_INVALID_JSON", repairedRequestBody, StringComparison.Ordinal);
+        using (var requestDocument = JsonDocument.Parse(repairedRequestBody))
+        {
+            var schema = requestDocument.RootElement.GetProperty("text").GetProperty("format").GetProperty("schema");
+            var definitions = schema.GetProperty("$defs");
+            var triggerValues = definitions.GetProperty("rule").GetProperty("properties").GetProperty("trigger").GetProperty("enum")
+                .EnumerateArray().Select(value => value.GetString()).ToArray();
+            var progressValues = definitions.GetProperty("contract").GetProperty("properties").GetProperty("progressKey").GetProperty("enum")
+                .EnumerateArray().Select(value => value.GetString()).ToArray();
+            var effectValues = definitions.GetProperty("effect").GetProperty("properties").GetProperty("type").GetProperty("enum")
+                .EnumerateArray().Select(value => value.GetString()).ToArray();
+            Assert.Contains("capture", triggerValues);
+            Assert.Contains("capture", progressValues);
+            Assert.Contains("territory", progressValues);
+            Assert.Contains("alliances", progressValues);
+            Assert.Contains("typedState", effectValues);
+            Assert.True(definitions.TryGetProperty("stateReference", out _));
+            Assert.True(definitions.TryGetProperty("stateDefinition", out _));
+            Assert.True(definitions.TryGetProperty("numberExpression", out _));
+            Assert.True(definitions.TryGetProperty("predicateExpression", out _));
+            Assert.True(definitions.TryGetProperty("stateMutation", out _));
+            Assert.True(definitions.TryGetProperty("dynamicTargetSelector", out var targetSelectorSchema), definitions.GetRawText());
+            var targetKinds = targetSelectorSchema.GetProperty("properties").GetProperty("kind").GetProperty("enum")
+                .EnumerateArray().Select(value => value.GetString()).ToArray();
+            Assert.Equal(new[] { "none", "tile", "unit", "building" }, targetKinds);
+            Assert.Contains("maxCandidates", targetSelectorSchema.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+            var ruleSchema = definitions.GetProperty("rule");
+            Assert.Contains("stateDefinitions", ruleSchema.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+            Assert.Equal("#/$defs/stateDefinition", ruleSchema.GetProperty("properties").GetProperty("stateDefinitions").GetProperty("items").GetProperty("$ref").GetString());
+            var conditionSchema = definitions.GetProperty("condition");
+            Assert.Contains("predicate", conditionSchema.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+            Assert.Equal(JsonValueKind.Array, conditionSchema.GetProperty("properties").GetProperty("predicate").GetProperty("anyOf").ValueKind);
+            Assert.Contains("stateMutation", definitions.GetProperty("effect").GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+            var actionSchema = definitions.GetProperty("action");
+            Assert.Contains("targetSelector", actionSchema.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+            Assert.Equal("#/$defs/dynamicTargetSelector", actionSchema.GetProperty("properties").GetProperty("targetSelector").GetProperty("$ref").GetString());
+        }
 
         await using var database = new SqliteConnection("Data Source=" + Path.Combine(temporaryDirectory, "api.db"));
         await database.OpenAsync();
@@ -318,27 +524,11 @@ public sealed class ApiEndpointTests : IAsyncLifetime
             await seed.ExecuteNonQueryAsync();
         }
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/rules/generate")
-        {
-            Content = JsonContent.Create(new
-            {
-                runId,
-                turn = 1,
-                catalogHash = "catalog",
-                map = new[] { new { } },
-                entities = Array.Empty<object>(),
-                buildings = Array.Empty<object>(),
-                factions = new[] { new { id = 1, kind = "player" } },
-                actionStats = Array.Empty<object>(),
-                activeRules = Array.Empty<object>(),
-                victoryContracts = Array.Empty<object>(),
-                dynamicActions = Array.Empty<object>(),
-                ruleState = Array.Empty<object>(),
-                journal = Array.Empty<object>()
-            })
-        };
-        request.Headers.TryAddWithoutValidation("Idempotency-Key", "proxy-quota-test");
-        request.Headers.TryAddWithoutValidation("X-Forwarded-For", forwardedClientIp);
+        // Quota behavior must be exercised with a snapshot that passes the same
+        // deep world-topology validation as production traffic. A malformed
+        // anonymous placeholder would correctly stop at INVALID_SNAPSHOT before
+        // the forwarded client identity reaches the quota claim.
+        using var request = CreateGenerationRequest(ValidSnapshot(runId), "proxy-quota-test", forwardedClientIp);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", await IssueSessionAsync(runId, forwardedClientIp));
 
         using var response = await Client.SendAsync(request);
@@ -349,7 +539,7 @@ public sealed class ApiEndpointTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task LostSuccessfulResponse_IsReplayedAfterJournalAndPhaseChange()
+    public async Task LostSuccessfulResponse_IsReplayedAfterRetryDiagnosticsChange()
     {
         const string requestKey = "cached-response-loss-test";
         const string forwardedClientIp = "198.51.100.10";
@@ -412,12 +602,15 @@ public sealed class ApiEndpointTests : IAsyncLifetime
         }
 
         snapshot.journal.Add("응답을 받지 못해 재시도합니다.");
-        snapshot.phase = RunPhase.Planning;
-        snapshot.planningPrepared = !snapshot.planningPrepared;
         snapshot.ruleBudget = new RuleRuntimeBudget { turn = snapshot.turn, dispatches = 2, effects = 4 };
+        Assert.Equal(requestHash, ApiPolicies.ComputeRuleRequestHash(snapshot));
+        var wireJson = JsonSerializer.Serialize(snapshot, jsonOptions);
+        var wireSnapshot = JsonSerializer.Deserialize<GameSnapshotV1>(wireJson, jsonOptions);
+        Assert.NotNull(wireSnapshot);
+        Assert.Equal(requestHash, ApiPolicies.ComputeRuleRequestHash(wireSnapshot!));
         using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/rules/generate")
         {
-            Content = new StringContent(JsonSerializer.Serialize(snapshot, jsonOptions), Encoding.UTF8, "application/json")
+            Content = new StringContent(wireJson, Encoding.UTF8, "application/json")
         };
         request.Headers.TryAddWithoutValidation("Idempotency-Key", requestKey);
         request.Headers.TryAddWithoutValidation("X-Forwarded-For", forwardedClientIp);
@@ -429,6 +622,22 @@ public sealed class ApiEndpointTests : IAsyncLifetime
         Assert.True(response.StatusCode == HttpStatusCode.OK, payload + "\n" + ReadOutput());
         Assert.Contains(requestKey, payload, StringComparison.Ordinal);
         Assert.Contains("캐시된 안전 규칙", payload, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RuleGeneration_RejectsNonAwaitingLifecycleBeforeUpstream()
+    {
+        var before = Volatile.Read(ref upstreamRequestCount);
+        var snapshot = ValidSnapshot("invalid-lifecycle-run");
+        snapshot.phase = RunPhase.Planning;
+        using var request = CreateGenerationRequest(snapshot, "invalid-lifecycle-key", "198.51.100.77");
+
+        using var response = await Client.SendAsync(request);
+        var payload = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains("RULE_GENERATION_LIFECYCLE_INVALID", payload, StringComparison.Ordinal);
+        Assert.Equal(before, Volatile.Read(ref upstreamRequestCount));
     }
 
     [Fact]

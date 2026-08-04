@@ -7,5 +7,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.8" />
     <Compile Include="../../Assets/OnlyMyGame/Core/RuleCore.cs" Link="Core/RuleCore.cs" />
+    <Compile Include="../../Assets/OnlyMyGame/Core/RuleExpressions.cs" Link="Core/RuleExpressions.cs" />
+    <Compile Include="../../Assets/OnlyMyGame/Core/DynamicActionTargeting.cs" Link="Core/DynamicActionTargeting.cs" />
   </ItemGroup>
 </Project>

@@ -1,14 +1,121 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using Newtonsoft.Json;
 using NUnit.Framework;
 using OnlyMyGame.Core;
+using OnlyMyGame.Runtime;
 
 namespace OnlyMyGame.Tests
 {
     public sealed class CommercialRegressionTests
     {
+        [Test]
+        public void AwaitingRuleSnapshotKeepsTurnStateStableAcrossRestart()
+        {
+            var game = WorldGenerator.Create(1701);
+            var turnState = new StateDefinitionV1
+            {
+                scope = RuleStateScope.Turn,
+                scopeId = "",
+                key = "restart_turn_state",
+                valueType = RuleStateValueType.Number,
+                koreanName = "재시작 턴 상태",
+                iconToken = "restart_turn",
+                colorHex = "#33AAFF",
+                initialNumber = 4
+            };
+            game.activeRules.Add(new RuleNodeV1
+            {
+                id = "restart-turn-state-owner",
+                name = "재시작 상태 규칙",
+                description = "규칙 수신 재시작 안정성을 검증합니다.",
+                trigger = EventType.TurnStart,
+                appliedTurn = 1,
+                durationTurns = 10,
+                stateDefinitions = new List<StateDefinitionV1> { turnState },
+                effects = new List<EffectNode> { new EffectNode { type = EffectType.Resource, resource = ResourceType.Food, amount = 1 } }
+            });
+            Assert.IsTrue(RuleExpressionRuntime.EnsureActiveDefinitions(game));
+            Assert.IsTrue(RuleExpressionRuntime.ApplyStateMutation(new StateMutationV1
+            {
+                op = StateMutationOp.Set,
+                state = new StateReferenceV1 { scope = RuleStateScope.Turn, scopeId = "", key = turnState.key },
+                numberValue = new NumberExpressionV1 { op = NumberExpressionOp.Constant, constant = 99 }
+            }, game));
+
+            game.turn++;
+            game.phase = RunPhase.AwaitingRules;
+            game.planningPrepared = false;
+            var prepare = typeof(GameController).GetMethod("PrepareTypedStateForCurrentTurn", BindingFlags.Static | BindingFlags.NonPublic);
+            var normalize = typeof(GameController).GetMethod("NormalizeSnapshot", BindingFlags.Static | BindingFlags.NonPublic);
+            Assert.IsNotNull(prepare);
+            Assert.IsNotNull(normalize);
+            Assert.IsTrue((bool)prepare.Invoke(null, new object[] { game }));
+            var beforeRestart = JsonConvert.SerializeObject(game);
+
+            var restored = JsonConvert.DeserializeObject<GameSnapshotV1>(beforeRestart);
+            Assert.IsTrue((bool)normalize.Invoke(null, new object[] { restored }));
+            var afterRestart = JsonConvert.SerializeObject(restored);
+
+            Assert.AreEqual(beforeRestart, afterRestart, "동일 idempotency key로 재시도할 snapshot payload가 재시작 때문에 바뀌면 안 됩니다.");
+            var restoredTurnState = restored.typedRuleState.Single(entry => entry.key == turnState.key);
+            Assert.AreEqual(game.turn, restoredTurnState.stateTurn);
+            Assert.AreEqual(turnState.initialNumber, restoredTurnState.numberValue);
+        }
+
+        [Test]
+        public void CommandPresentationMatchesCaptureHuntAndCollisionRules()
+        {
+            Assert.AreEqual("점령", GameController.CommandKorean(CommandType.Capture));
+            Assert.AreEqual(2, GameRules.CommandCost(CommandType.Capture));
+            StringAssert.Contains("살아있는 적 유닛·거점이 없으면 점령", GameController.ExpectedRange(CommandType.Capture));
+            Assert.AreEqual("초원 식량 2 / 숲 3, 행운 70 이상이면 +1", GameController.ExpectedRange(CommandType.Hunt));
+            StringAssert.Contains("행운 보정+시드 난수", GameController.ExpectedRange(CommandType.Move));
+        }
+
+        [Test]
+        public void RuleWorldCuesTargetVisibleAffectedUnitsWithoutLeakingFog()
+        {
+            var game = PlayableSnapshot(99);
+            var visibleEnemy = new UnitState { id = 2, factionId = 2, position = new HexCoord(1, 0), tags = new List<string> { "징표" } };
+            var hiddenEnemy = new UnitState { id = 3, factionId = 2, position = new HexCoord(2, 0), tags = new List<string> { "징표" } };
+            game.entities.Add(visibleEnemy);
+            game.entities.Add(hiddenEnemy);
+            foreach (var tile in game.map) tile.visible = tile.position.Equals(new HexCoord(0, 0)) || tile.position.Equals(visibleEnemy.position);
+            var rule = new RuleNodeV1
+            {
+                id = "marked-enemies",
+                name = "징표 추적",
+                condition = new ConditionNode { op = CompareOp.HasTag, left = "faction:2", text = "징표" },
+                effects = new List<EffectNode> { new EffectNode { type = EffectType.Relation, amount = -5 } }
+            };
+
+            var targets = RuleCuePlanner.ResolveVisibleTargets(game, rule, 6);
+
+            CollectionAssert.Contains(targets, visibleEnemy.position, "보이는 실제 영향 대상에는 월드 큐가 있어야 합니다.");
+            CollectionAssert.DoesNotContain(targets, hiddenEnemy.position, "시야 밖 대상 위치를 월드 큐로 누설하면 안 됩니다.");
+        }
+
+        [Test]
+        public void GlobalRuleWorldCueFallsBackToVisiblePlayerCommandAnchor()
+        {
+            var game = PlayableSnapshot(100);
+            foreach (var tile in game.map) tile.visible = tile.position.Equals(new HexCoord(0, 0));
+            var rule = new RuleNodeV1
+            {
+                id = "global-supply",
+                name = "원정 보급",
+                effects = new List<EffectNode> { new EffectNode { type = EffectType.Resource, resource = ResourceType.Food, amount = 2 } }
+            };
+
+            var targets = RuleCuePlanner.ResolveVisibleTargets(game, rule, 3);
+
+            Assert.AreEqual(1, targets.Count);
+            Assert.AreEqual(new HexCoord(0, 0), targets[0], "전역 규칙은 보이는 플레이어 본부에 설명 큐를 고정해야 합니다.");
+        }
+
         [Test]
         public void BeginPlanningRunsOnceAndSpFollowsTurnLifecycle()
         {
@@ -286,7 +393,7 @@ namespace OnlyMyGame.Tests
         }
 
         [Test]
-        public void BuildReservationsUseProjectedCostsAndRejectDuplicateTiles()
+        public void BuildReservationsUseSelectedCostsAndRejectDuplicateTiles()
         {
             var projected = PlayableSnapshot(207);
             var projectedPlayer = projected.factions.First(f => f.id == 1);
@@ -295,26 +402,28 @@ namespace OnlyMyGame.Tests
 
             TurnResolver.Resolve(projected, new List<PlannedCommand>
             {
-                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Build, target = new HexCoord(0, 1) },
-                new PlannedCommand { factionId = 1, unitId = 2, type = CommandType.Build, target = new HexCoord(1, 0) }
+                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Build, target = new HexCoord(0, 1), buildingType = BuildingType.Warehouse },
+                new PlannedCommand { factionId = 1, unitId = 2, type = CommandType.Build, target = new HexCoord(1, 0), buildingType = BuildingType.Workshop }
             }, new DeterministicRandom(207), new List<string>());
 
             Assert.AreEqual(4, projectedPlayer.resources.wood, "첫 Warehouse 비용 3만 소비되어야 합니다.");
             Assert.AreEqual(1, projected.buildings.Count(b => b.factionId == 1 && b.type == BuildingType.Warehouse));
-            Assert.AreEqual(0, projected.buildings.Count(b => b.factionId == 1 && b.type == BuildingType.Workshop), "두 번째 건설은 투영된 Workshop 비용 5를 기준으로 거부되어야 합니다.");
+            Assert.AreEqual(0, projected.buildings.Count(b => b.factionId == 1 && b.type == BuildingType.Workshop), "선택한 Workshop 비용 5를 예약할 목재가 없으면 거부되어야 합니다.");
             Assert.AreEqual(projectedPlayer.maxSp - GameRules.CommandCost(CommandType.Build), projectedPlayer.sp, "목재 예약에서 거부된 건설은 SP를 소비하면 안 됩니다.");
 
             var fullyFunded = PlayableSnapshot(214);
             var fullyFundedPlayer = fullyFunded.factions.First(f => f.id == 1);
             fullyFundedPlayer.resources.wood = 8;
+            fullyFundedPlayer.resources.iron = 2;
             fullyFunded.entities.Add(new UnitState { id = 2, factionId = 1, position = new HexCoord(1, 0) });
             TurnResolver.Resolve(fullyFunded, new List<PlannedCommand>
             {
-                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Build, target = new HexCoord(0, 1) },
-                new PlannedCommand { factionId = 1, unitId = 2, type = CommandType.Build, target = new HexCoord(1, 0) }
+                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Build, target = new HexCoord(0, 1), buildingType = BuildingType.Warehouse },
+                new PlannedCommand { factionId = 1, unitId = 2, type = CommandType.Build, target = new HexCoord(1, 0), buildingType = BuildingType.Workshop }
             }, new DeterministicRandom(214), new List<string>());
 
             Assert.AreEqual(0, fullyFundedPlayer.resources.wood, "충분한 목재가 있으면 Warehouse 3과 Workshop 5가 모두 소비되어야 합니다.");
+            Assert.AreEqual(0, fullyFundedPlayer.resources.iron, "Workshop의 명시된 철 비용 2가 소비되어야 합니다.");
             Assert.AreEqual(1, fullyFunded.buildings.Count(b => b.factionId == 1 && b.type == BuildingType.Warehouse));
             Assert.AreEqual(1, fullyFunded.buildings.Count(b => b.factionId == 1 && b.type == BuildingType.Workshop));
             Assert.AreEqual(fullyFundedPlayer.maxSp - GameRules.CommandCost(CommandType.Build) * 2, fullyFundedPlayer.sp);
@@ -324,13 +433,72 @@ namespace OnlyMyGame.Tests
             duplicatePlayer.resources.wood = 8;
             TurnResolver.Resolve(duplicate, new List<PlannedCommand>
             {
-                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Build, target = new HexCoord(0, 1) },
-                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Build, target = new HexCoord(0, 1) }
+                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Build, target = new HexCoord(0, 1), buildingType = BuildingType.Warehouse },
+                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Build, target = new HexCoord(0, 1), buildingType = BuildingType.Warehouse }
             }, new DeterministicRandom(208), new List<string>());
 
             Assert.AreEqual(5, duplicatePlayer.resources.wood);
             Assert.AreEqual(1, duplicate.buildings.Count(b => b.factionId == 1 && b.type == BuildingType.Warehouse), "같은 타일은 한 턴에 한 번만 건설 예약할 수 있어야 합니다.");
             Assert.AreEqual(duplicatePlayer.maxSp - GameRules.CommandCost(CommandType.Build), duplicatePlayer.sp, "중복 타일 건설은 SP를 소비하면 안 됩니다.");
+        }
+
+        [Test]
+        public void WorkshopBuildRejectsInsufficientOrReservedIronWithoutPartialSpending()
+        {
+            var insufficient = PlayableSnapshot(215);
+            var insufficientPlayer = insufficient.factions.First(faction => faction.id == 1);
+            insufficientPlayer.resources.wood = 10;
+            insufficientPlayer.resources.iron = 1;
+
+            TurnResolver.Resolve(insufficient, new List<PlannedCommand>
+            {
+                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Build, target = new HexCoord(0, 1), buildingType = BuildingType.Workshop }
+            }, new DeterministicRandom(215), new List<string>());
+
+            Assert.AreEqual(10, insufficientPlayer.resources.wood, "철이 부족한 건설은 목재를 부분 소비하면 안 됩니다.");
+            Assert.AreEqual(1, insufficientPlayer.resources.iron);
+            Assert.AreEqual(insufficientPlayer.maxSp, insufficientPlayer.sp, "자원 검증에서 거부된 건설은 SP도 소비하면 안 됩니다.");
+            Assert.AreEqual(0, insufficient.buildings.Count(building => building.factionId == 1 && building.type == BuildingType.Workshop));
+
+            var reserved = PlayableSnapshot(216);
+            var reservedPlayer = reserved.factions.First(faction => faction.id == 1);
+            reservedPlayer.resources.wood = 10;
+            reservedPlayer.resources.iron = 3;
+            reserved.entities.Add(new UnitState { id = 2, factionId = 1, position = new HexCoord(1, 0) });
+
+            TurnResolver.Resolve(reserved, new List<PlannedCommand>
+            {
+                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Build, target = new HexCoord(0, 1), buildingType = BuildingType.Workshop },
+                new PlannedCommand { factionId = 1, unitId = 2, type = CommandType.Build, target = new HexCoord(1, 0), buildingType = BuildingType.Workshop }
+            }, new DeterministicRandom(216), new List<string>());
+
+            Assert.AreEqual(5, reservedPlayer.resources.wood);
+            Assert.AreEqual(1, reservedPlayer.resources.iron, "철 3으로 비용 2인 작업장 두 채를 동시에 예약할 수 없어야 합니다.");
+            Assert.AreEqual(1, reserved.buildings.Count(building => building.factionId == 1 && building.type == BuildingType.Workshop));
+            Assert.AreEqual(reservedPlayer.maxSp - GameRules.CommandCost(CommandType.Build), reservedPlayer.sp, "철 예약에서 거부된 두 번째 건설은 SP를 소비하면 안 됩니다.");
+        }
+
+        [Test]
+        public void LegacyBuildCommandWithoutTypeDefaultsToWarehouse()
+        {
+            var game = PlayableSnapshot(217);
+            var player = game.factions.First(faction => faction.id == 1);
+            player.resources.wood = 3;
+            var legacyJson = JsonConvert.SerializeObject(new
+            {
+                factionId = 1,
+                unitId = 1,
+                type = CommandType.Build,
+                target = new HexCoord(0, 1)
+            });
+            var legacyCommand = JsonConvert.DeserializeObject<PlannedCommand>(legacyJson);
+
+            Assert.IsNotNull(legacyCommand);
+            Assert.AreEqual(BuildingType.Warehouse, legacyCommand.buildingType, "buildingType 필드가 없는 이전 명령은 안전한 창고로 해석되어야 합니다.");
+            TurnResolver.Resolve(game, new List<PlannedCommand> { legacyCommand }, new DeterministicRandom(217), new List<string>());
+
+            Assert.AreEqual(0, player.resources.wood);
+            Assert.AreEqual(1, game.buildings.Count(building => building.factionId == 1 && building.type == BuildingType.Warehouse));
         }
 
         [Test]
@@ -1154,8 +1322,11 @@ namespace OnlyMyGame.Tests
                 id = "soak-contract-" + slot,
                 title = "장기 생존 계약 " + slot + " v" + version,
                 description = "충분한 유지 기간과 사전 경고를 갖춘 도달 가능한 계약입니다.",
-                progressKey = "kills",
-                target = 30,
+                // The soak issues no combat or capture commands. A territory target is
+                // physically reachable within the validator's six-turn horizon on this
+                // 19-tile map, but remains incomplete throughout this lifecycle-only run.
+                progressKey = "territory",
+                target = 7,
                 minimumTurns = RuleValidator.MinimumFirstVictoryTurns,
                 announcedTurn = announcedTurn,
                 achievableFromTurn = announcedTurn + 1

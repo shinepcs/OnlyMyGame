@@ -8,17 +8,27 @@ using System.Linq;
 // wire model where explicit runtime validation is the compatibility boundary.
 #nullable disable
 
+// These wire DTOs are serialized by Newtonsoft/System.Text.Json, not Unity's
+// field serializer. Recursive rule graphs are intentional and bounded by the
+// validators below, so Unity serialization-cycle diagnostics do not apply.
+#pragma warning disable UAC1005
+#pragma warning disable UAC1006
+#pragma warning disable UAC1008
+
 namespace OnlyMyGame.Core
 {
     public enum ResourceType { None, Food, Wood, Stone, Iron, Coin }
     public enum FactionKind { Player, Skeleton, Neutral }
     public enum BuildingType { Headquarters, Warehouse, Workshop, Watchtower, Market, Barracks }
-    public enum EventType { TurnStart, TurnEnd, Move, Attack, Kill, Gather, Build, Trade, RelationChanged, TileEntered }
-    public enum EffectType { Resource, Sp, Relation, Status, Spawn, UnlockAction, Schedule, FactionSwitch }
+    public enum EventType { TurnStart, TurnEnd, Move, Attack, Kill, Gather, Build, Trade, RelationChanged, TileEntered, Capture }
+    public enum EffectType { Resource, Sp, Relation, Status, Spawn, UnlockAction, Schedule, FactionSwitch, TypedState }
     public enum CompareOp { Always, Equal, GreaterOrEqual, LessOrEqual, HasTag, OwnerIs }
-    public enum CommandType { Move, Gather, Hunt, Attack, Trade, Persuade, Hire, Build, Upgrade, Dynamic }
+    public enum CommandType { Move, Gather, Hunt, Attack, Trade, Persuade, Hire, Build, Upgrade, Dynamic, Capture }
     public enum RunOutcome { Ongoing, Victory, Defeat }
     public enum RunPhase { Planning, Resolving, AwaitingRules, Terminal }
+    public enum DynamicTargetKind { None, Tile, Unit, Building }
+    public enum DynamicTargetOwnership { Any, Player, NonPlayer, Neutral }
+    public enum DynamicTargetVisibility { Visible, Explored }
 
     [Serializable] public struct HexCoord : IEquatable<HexCoord>
     {
@@ -92,8 +102,14 @@ namespace OnlyMyGame.Core
         public const int MaxStoredRules = 48;
         public const int MaxDynamicActions = 32;
         public const int MaxVictoryContracts = 3;
+        public const int MaxDynamicActionsPerRuleSet = 3;
         public const int MaxConditionNodes = 256;
         public const int MaxConditionDepth = 4;
+        // Selector work is charged before a condition is evaluated. These caps
+        // bound both one UI availability query and all rule attempts in a turn
+        // on WebGL's single main thread.
+        public const int MaxConditionWorkPerEvaluation = 32768;
+        public const int MaxRuleConditionWorkPerTurn = 131072;
         public const int MaxEffectsPerRule = 16;
         public const int MaxRuleDispatchesPerTurn = 64;
         public const int MaxRuleActivationsPerTurn = 64;
@@ -106,6 +122,26 @@ namespace OnlyMyGame.Core
         public const int MaxTagsPerUnit = 32;
         public const int MaxJournalEntries = 512;
         public const int MaxStateVariables = 128;
+        // A 30-turn commercial run can receive rules every turn. Capping the
+        // newly reserved state identities per response keeps the worst-case
+        // run below the persistent state ceiling without deleting run history.
+        public const int MaxStateDefinitionsPerRule = 4;
+        public const int MaxNewStateIdentitiesPerRuleSet = 4;
+        public const int MaxStateSetElements = 32;
+        public const int MaxRecentActionTurns = 6;
+        public const int MaxRecentActionEntries = 128;
+        public const int MaxDynamicTargetDistance = 32;
+        public const int MaxDynamicTargetCandidates = 32;
+        public const int MaxDynamicTargetScanCandidates = 4096;
+        // Includes index construction, source collection scans, and deterministic
+        // ordering for one selected actor. Keep this separate from expression and
+        // binding budgets so a large observable world cannot monopolize WebGL's
+        // main thread before those later budgets are reached.
+        public const int MaxDynamicTargetResolutionWork = 131072;
+        public const int MaxDynamicTargetConditionWork = 65536;
+        public const int MaxDynamicTargetBindingWork = 65536;
+        public const int MaxDynamicTargetValidationWork = 262144;
+        public const int MaxDynamicTargetBatchActions = MaxDynamicActionsPerRuleSet;
         public const int MaxStateMagnitude = 1000000;
         public const int MaxIdentifierLength = 64;
         public const int MaxNameLength = 80;
@@ -116,7 +152,10 @@ namespace OnlyMyGame.Core
     [Serializable] public sealed class RuleRuntimeBudget
     {
         public int turn = int.MinValue;
+        [NonSerialized] internal int definitionRegistryTurn = int.MinValue;
+        [NonSerialized] internal List<StateDefinitionV1> definitionRegistryDefinitions;
         public int dispatches;
+        public int conditionWork;
         public int activations;
         public int effects;
         public int spawnedEntities;
@@ -142,18 +181,50 @@ namespace OnlyMyGame.Core
         public List<VictoryContractV1> victoryContracts = new List<VictoryContractV1>();
         public List<DynamicActionV1> dynamicActions = new List<DynamicActionV1>();
         public List<RuleStateEntry> ruleState = new List<RuleStateEntry>();
+        public List<TypedRuleStateEntryV1> typedRuleState = new List<TypedRuleStateEntryV1>();
+        public List<ActionTurnStatV1> recentActionStats = new List<ActionTurnStatV1>();
         public RuleRuntimeBudget ruleBudget = new RuleRuntimeBudget();
         public List<string> journal = new List<string>();
         public string catalogHash = "kaykit-v1";
     }
 
-    [Serializable] public sealed class ConditionNode { public CompareOp op; public string left; public int value; public string text; public List<ConditionNode> all; }
-    [Serializable] public sealed class EffectNode { public EffectType type; public ResourceType resource; public int amount; public string target; public string key; public string value; public int delay; }
-    [Serializable] public sealed class RuleNodeV1 { public string id; public string name; public string description; public EventType trigger; public ConditionNode condition = new ConditionNode { op = CompareOp.Always }; public List<EffectNode> effects = new List<EffectNode>(); public int priority; public int durationTurns = 3; public int appliedTurn; public string worldCue; }
-    [Serializable] public sealed class DynamicActionV1 { public string id; public string name; public string description; public int spCost; public ResourceType resourceCost; public int resourceAmount; public int cooldown; public int availableTurn; public ConditionNode condition = new ConditionNode { op = CompareOp.Always }; public List<EffectNode> effects = new List<EffectNode>(); }
+    [Serializable] public sealed class ConditionNode { public CompareOp op; public string left; public int value; public string text; public List<ConditionNode> all; public PredicateExpressionV1 predicate; }
+    [Serializable] public sealed class EffectNode { public EffectType type; public ResourceType resource; public int amount; public string target; public string key; public string value; public int delay; public StateMutationV1 stateMutation; }
+    [Serializable] public sealed class RuleNodeV1 { public string id; public string name; public string description; public EventType trigger; public ConditionNode condition = new ConditionNode { op = CompareOp.Always }; public List<EffectNode> effects = new List<EffectNode>(); public List<StateDefinitionV1> stateDefinitions = new List<StateDefinitionV1>(); public int priority; public int durationTurns = 3; public int appliedTurn; public string worldCue; }
+    [Serializable] public sealed class DynamicTargetSelectorV1
+    {
+        public DynamicTargetKind kind = DynamicTargetKind.None;
+        public DynamicTargetOwnership ownership = DynamicTargetOwnership.Any;
+        public DynamicTargetVisibility visibility = DynamicTargetVisibility.Visible;
+        public int minDistance;
+        public int maxDistance;
+        public int maxCandidates = 16;
+    }
+    [Serializable] public sealed class DynamicActionV1 { public string id; public string name; public string description; public int spCost; public ResourceType resourceCost; public int resourceAmount; public int cooldown; public int availableTurn; public DynamicTargetSelectorV1 targetSelector = new DynamicTargetSelectorV1(); public ConditionNode condition = new ConditionNode { op = CompareOp.Always }; public List<EffectNode> effects = new List<EffectNode>(); }
     [Serializable] public sealed class VictoryContractV1 { public string id; public string title; public string description; public string progressKey; public int target; public int minimumTurns = 3; public int announcedTurn; public int achievableFromTurn; public int replaceWarningTurn; public string worldCue; }
     [Serializable] public sealed class RuleSetV1 { public string schemaVersion = "v1"; public string requestId; public int applyTurn; public string koreanSummary; public List<RuleNodeV1> changes = new List<RuleNodeV1>(); public List<DynamicActionV1> actions = new List<DynamicActionV1>(); public List<VictoryContractV1> victoryContracts = new List<VictoryContractV1>(); }
     [Serializable] public sealed class RuleValidationResult { public bool valid; public List<string> errors = new List<string>(); public List<string> diagnostics = new List<string>(); }
+
+    internal sealed class RuleValidationWorkBudget
+    {
+        private int remaining;
+        public bool Exhausted { get; private set; }
+
+        public RuleValidationWorkBudget(int maximum) { remaining = Math.Max(0, maximum); }
+
+        public bool TrySpend(long amount)
+        {
+            amount = Math.Max(1L, amount);
+            if (amount > remaining)
+            {
+                remaining = 0;
+                Exhausted = true;
+                return false;
+            }
+            remaining -= (int)amount;
+            return true;
+        }
+    }
 
     public static class RuleValidator
     {
@@ -183,7 +254,53 @@ namespace OnlyMyGame.Core
             }
 
             ValidateSnapshotBounds(snapshot, result);
-            ValidateDynamicAction(action, snapshot, result);
+            // Runtime button gating uses the current world, so a targeted action
+            // must have at least one candidate whose bindings can execute. Stored
+            // snapshot validation remains structural and may preserve actions that
+            // become available again after visibility or ownership changes.
+            ValidateDynamicAction(action, snapshot, result, false, true);
+            DynamicActionTargeting.ValidateTargetAvailability(new[] { action }, snapshot, result.errors, "ACTION");
+            result.valid = result.errors.Count == 0;
+            return result;
+        }
+
+        /// <summary>
+        /// Rechecks a live action's bounded structure without scanning every actor
+        /// for current targets. Ingress and save-load validation own the expensive
+        /// receipt/world checks; HUD polling pairs this with the selected-actor
+        /// resolver instead.
+        /// </summary>
+        public static RuleValidationResult ValidateDynamicActionStructureForRuntime(DynamicActionV1 action, GameSnapshotV1 snapshot)
+        {
+            var result = new RuleValidationResult { valid = false };
+            if (snapshot == null)
+            {
+                result.errors.Add("SNAPSHOT_NULL");
+                return result;
+            }
+
+            ValidateRuntimeCollectionShape(snapshot, result);
+            ValidateDynamicAction(action, snapshot, result, false, false);
+            result.valid = result.errors.Count == 0;
+            return result;
+        }
+
+        /// <summary>
+        /// Rechecks references whose validity depends on the current world without
+        /// performing the expensive all-actor target-availability scan. Execution
+        /// uses this after HUD structure checks and immediately before mutation.
+        /// </summary>
+        public static RuleValidationResult ValidateDynamicActionCurrentWorldForRuntime(DynamicActionV1 action, GameSnapshotV1 snapshot)
+        {
+            var result = new RuleValidationResult { valid = false };
+            if (snapshot == null)
+            {
+                result.errors.Add("SNAPSHOT_NULL");
+                return result;
+            }
+
+            ValidateRuntimeCollectionShape(snapshot, result);
+            ValidateDynamicAction(action, snapshot, result, false, true);
             result.valid = result.errors.Count == 0;
             return result;
         }
@@ -209,6 +326,7 @@ namespace OnlyMyGame.Core
             if ((long)set.applyTurn < snapshot.turn || (long)set.applyTurn > (long)snapshot.turn + 1L) result.errors.Add("APPLY_TURN_INVALID");
             if (set.changes == null || changes.Count < 1 || changes.Count > 3) result.errors.Add("RULE_COUNT_1_TO_3");
             if (set.actions == null) result.errors.Add("ACTIONS_NULL");
+            else if (set.actions.Count > RuleLimits.MaxDynamicActionsPerRuleSet) result.errors.Add("RULESET_ACTION_LIMIT");
             if (set.victoryContracts == null) result.errors.Add("VICTORY_CONTRACTS_NULL");
             var needsFirstContract = snapshot.turn >= 2 && !existingGoals.Any(goal => goal != null);
             if (needsFirstContract && goals.Count == 0) result.errors.Add("VICTORY_CONTRACT_REQUIRED");
@@ -229,8 +347,10 @@ namespace OnlyMyGame.Core
             ValidateUniqueIds(actions.Where(x => x != null).Select(x => x.id), "DUPLICATE_ACTION_ID", result);
             ValidateUniqueIds(goals.Where(x => x != null).Select(x => x.id), "DUPLICATE_VICTORY_ID", result);
             foreach (var rule in changes) ValidateRule(rule, snapshot, effectiveApplyTurn, result);
-            foreach (var action in actions) ValidateDynamicAction(action, snapshot, result);
+            foreach (var action in actions) ValidateDynamicAction(action, snapshot, result, false, true);
+            DynamicActionTargeting.ValidateTargetAvailability(actions, snapshot, result.errors, "ACTION");
             foreach (var goal in goals) ValidateVictory(goal, snapshot, result);
+            RuleExpressionValidator.ValidateProjectedDefinitions(changes, actions, snapshot, result.errors);
 
             if (factions.Count == 0 || factions.Any(f => f == null || f.maxSp < 3 || f.resources == null)) result.errors.Add("MIN_SP_OR_FACTION_STATE_VIOLATION");
             var declaredSpawns = SumSpawnAmounts(changes.SelectMany(r => r?.effects ?? new List<EffectNode>())) +
@@ -255,6 +375,7 @@ namespace OnlyMyGame.Core
             if ((snapshot.factions?.Count ?? 0) > RuleLimits.MaxFactions) result.errors.Add("FACTION_LIMIT");
             if ((snapshot.journal?.Count ?? 0) > RuleLimits.MaxJournalEntries || (snapshot.journal ?? new List<string>()).Any(entry => entry != null && entry.Length > RuleLimits.MaxDescriptionLength)) result.errors.Add("JOURNAL_LIMIT");
 
+            ValidateMapState(snapshot, result);
             ValidateUniqueEntityState(snapshot, result);
             var actionTypes = new HashSet<CommandType>();
             foreach (var stat in snapshot.actionStats ?? new List<ActionStat>())
@@ -262,8 +383,8 @@ namespace OnlyMyGame.Core
                 if (stat == null || !Enum.IsDefined(typeof(CommandType), stat.type) || stat.count < 0 || stat.count > RuleLimits.MaxStateMagnitude || !actionTypes.Add(stat.type)) result.errors.Add("ACTION_STAT_INVALID");
             }
             var ruleBudget = snapshot.ruleBudget;
-            var validBudgetFlags = 1 | 2 | 4 | 8 | 16 | 32;
-            if (ruleBudget != null && ruleBudget.turn != int.MinValue && (ruleBudget.turn < 0 || ruleBudget.turn > snapshot.turn || ruleBudget.dispatches < 0 || ruleBudget.dispatches > RuleLimits.MaxRuleDispatchesPerTurn || ruleBudget.activations < 0 || ruleBudget.activations > RuleLimits.MaxRuleActivationsPerTurn || ruleBudget.effects < 0 || ruleBudget.effects > RuleLimits.MaxRuleEffectsPerTurn || ruleBudget.spawnedEntities < 0 || ruleBudget.spawnedEntities > RuleLimits.MaxRuleSpawnsPerTurn || (ruleBudget.loggedLimits & ~validBudgetFlags) != 0)) result.errors.Add("RULE_RUNTIME_BUDGET_INVALID");
+            var validBudgetFlags = 1 | 2 | 4 | 8 | 16 | 32 | 64;
+            if (ruleBudget != null && ruleBudget.turn != int.MinValue && (ruleBudget.turn < 0 || ruleBudget.turn > snapshot.turn || ruleBudget.dispatches < 0 || ruleBudget.dispatches > RuleLimits.MaxRuleDispatchesPerTurn || ruleBudget.conditionWork < 0 || ruleBudget.conditionWork > RuleLimits.MaxRuleConditionWorkPerTurn || ruleBudget.activations < 0 || ruleBudget.activations > RuleLimits.MaxRuleActivationsPerTurn || ruleBudget.effects < 0 || ruleBudget.effects > RuleLimits.MaxRuleEffectsPerTurn || ruleBudget.spawnedEntities < 0 || ruleBudget.spawnedEntities > RuleLimits.MaxRuleSpawnsPerTurn || (ruleBudget.loggedLimits & ~validBudgetFlags) != 0)) result.errors.Add("RULE_RUNTIME_BUDGET_INVALID");
             var states = snapshot.ruleState ?? new List<RuleStateEntry>();
             if (states.Count > RuleLimits.MaxStateVariables) result.errors.Add("STATE_VARIABLE_LIMIT");
             var keys = new HashSet<string>(StringComparer.Ordinal);
@@ -273,10 +394,24 @@ namespace OnlyMyGame.Core
                 if (!keys.Add(state.key)) result.errors.Add("STATE_KEY_DUPLICATE:" + SafeId(state.key));
                 if (!IsBoundedStateValue(state.value)) result.errors.Add("STATE_VALUE_LIMIT:" + SafeId(state.key));
             }
+            RuleExpressionValidator.ValidateSnapshot(snapshot, result.errors);
             if ((snapshot.activeRules?.Count ?? 0) > RuleLimits.MaxStoredRules) result.errors.Add("STORED_RULE_LIMIT");
             if ((snapshot.dynamicActions?.Count ?? 0) > RuleLimits.MaxDynamicActions) result.errors.Add("DYNAMIC_ACTION_LIMIT");
             if ((snapshot.victoryContracts?.Count ?? 0) > RuleLimits.MaxVictoryContracts) result.errors.Add("VICTORY_LIMIT");
             ValidateStoredRuleContent(snapshot, result);
+        }
+
+        private static void ValidateRuntimeCollectionShape(GameSnapshotV1 snapshot, RuleValidationResult result)
+        {
+            if (snapshot.map == null || snapshot.entities == null || snapshot.buildings == null || snapshot.factions == null)
+            {
+                result.errors.Add("SNAPSHOT_LIST_NULL");
+                return;
+            }
+            if (snapshot.map.Count > RuleLimits.MaxMapTiles) result.errors.Add("MAP_TILE_LIMIT");
+            if (snapshot.entities.Count > RuleLimits.MaxEntities) result.errors.Add("ENTITY_LIMIT");
+            if (snapshot.buildings.Count > RuleLimits.MaxBuildings) result.errors.Add("BUILDING_LIMIT");
+            if (snapshot.factions.Count > RuleLimits.MaxFactions) result.errors.Add("FACTION_LIMIT");
         }
 
         private static void ValidateStoredRuleContent(GameSnapshotV1 snapshot, RuleValidationResult result)
@@ -302,7 +437,7 @@ namespace OnlyMyGame.Core
             foreach (var action in storedActions)
             {
                 if (action == null) result.errors.Add("SNAPSHOT_DYNAMIC_ACTION_NULL");
-                else ValidateDynamicAction(action, snapshot, result);
+                else ValidateDynamicAction(action, snapshot, result, false, false);
             }
             foreach (var goal in storedGoals) ValidateStoredVictory(goal, snapshot, result);
         }
@@ -312,27 +447,50 @@ namespace OnlyMyGame.Core
             var factionIds = new HashSet<int>();
             foreach (var faction in snapshot.factions ?? new List<FactionState>())
             {
-                if (faction == null || faction.id <= 0 || faction.id > RuleLimits.MaxStateMagnitude || !factionIds.Add(faction.id) || !IsValidResourceBag(faction.resources) || faction.maxSp < 3 || faction.maxSp > RuleLimits.MaxEffectMagnitude + 10 || faction.sp < 0 || faction.sp > faction.maxSp || faction.relationToPlayer < -100 || faction.relationToPlayer > 100) result.errors.Add("FACTION_STATE_INVALID");
+                if (faction == null || faction.id <= 0 || faction.id > RuleLimits.MaxStateMagnitude || !factionIds.Add(faction.id) || !Enum.IsDefined(typeof(FactionKind), faction.kind) || !IsValidResourceBag(faction.resources) || faction.maxSp < 3 || faction.maxSp > RuleLimits.MaxEffectMagnitude + 10 || faction.sp < 0 || faction.sp > faction.maxSp || faction.relationToPlayer < -100 || faction.relationToPlayer > 100) result.errors.Add("FACTION_STATE_INVALID");
             }
             if (!(snapshot.factions ?? new List<FactionState>()).Any(f => f != null && f.id == 1 && f.kind == FactionKind.Player)) result.errors.Add("PLAYER_FACTION_MISSING");
 
+            var mapPositions = new HashSet<HexCoord>((snapshot.map ?? new List<TileState>()).Where(tile => tile != null).Select(tile => tile.position));
             var unitIds = new HashSet<int>();
             foreach (var unit in snapshot.entities ?? new List<UnitState>())
             {
-                if (unit == null || unit.id <= 0 || unit.id > RuleLimits.MaxStateMagnitude || !unitIds.Add(unit.id) || !factionIds.Contains(unit.factionId) || unit.hp < 0 || unit.hp > RuleLimits.MaxStateMagnitude || unit.alive && unit.hp <= 0 || unit.speed < 0 || unit.speed > RuleLimits.MaxEffectMagnitude || (unit.tags?.Count ?? 0) > RuleLimits.MaxTagsPerUnit || (unit.tags ?? new List<string>()).Any(tag => !IsBoundedText(tag, RuleLimits.MaxIdentifierLength, false))) result.errors.Add("UNIT_STATE_INVALID");
+                if (unit == null || unit.id <= 0 || unit.id > RuleLimits.MaxStateMagnitude || !unitIds.Add(unit.id) || !factionIds.Contains(unit.factionId) || !mapPositions.Contains(unit.position) || unit.hp < 0 || unit.hp > RuleLimits.MaxStateMagnitude || unit.alive && unit.hp <= 0 || unit.speed < 0 || unit.speed > RuleLimits.MaxEffectMagnitude || (unit.tags?.Count ?? 0) > RuleLimits.MaxTagsPerUnit || (unit.tags ?? new List<string>()).Any(tag => !IsBoundedText(tag, RuleLimits.MaxIdentifierLength, false))) result.errors.Add("UNIT_STATE_INVALID");
             }
 
             var buildingIds = new HashSet<int>();
             foreach (var building in snapshot.buildings ?? new List<BuildingState>())
             {
-                if (building == null || building.id <= 0 || building.id > RuleLimits.MaxStateMagnitude || !buildingIds.Add(building.id) || !factionIds.Contains(building.factionId) || building.level < 1 || building.level > RuleLimits.MaxEffectMagnitude || building.hp < 0 || building.hp > RuleLimits.MaxStateMagnitude) result.errors.Add("BUILDING_STATE_INVALID");
+                if (building == null || building.id <= 0 || building.id > RuleLimits.MaxStateMagnitude || !buildingIds.Add(building.id) || !factionIds.Contains(building.factionId) || !mapPositions.Contains(building.position) || !Enum.IsDefined(typeof(BuildingType), building.type) || building.level < 1 || building.level > RuleLimits.MaxEffectMagnitude || building.hp < 0 || building.hp > RuleLimits.MaxStateMagnitude) result.errors.Add("BUILDING_STATE_INVALID");
+            }
+        }
+
+        private static void ValidateMapState(GameSnapshotV1 snapshot, RuleValidationResult result)
+        {
+            var factionIds = new HashSet<int>((snapshot.factions ?? new List<FactionState>()).Where(faction => faction != null && faction.id > 0).Select(faction => faction.id));
+            var positions = new HashSet<HexCoord>();
+            foreach (var tile in snapshot.map ?? new List<TileState>())
+            {
+                if (tile == null)
+                {
+                    result.errors.Add("TILE_STATE_INVALID");
+                    continue;
+                }
+
+                var coordinateInRange = Math.Abs((long)tile.position.q) <= RuleLimits.MaxStateMagnitude && Math.Abs((long)tile.position.r) <= RuleLimits.MaxStateMagnitude;
+                var ownerExists = tile.owner == 0 || factionIds.Contains(tile.owner);
+                var stateIsValid = coordinateInRange && positions.Add(tile.position) &&
+                                   IsBoundedText(tile.terrain, RuleLimits.MaxIdentifierLength, false) &&
+                                   Enum.IsDefined(typeof(ResourceType), tile.resource) && tile.amount >= 0 && tile.amount <= RuleLimits.MaxStateMagnitude &&
+                                   ownerExists && (!tile.visible || tile.explored);
+                if (!stateIsValid) result.errors.Add("TILE_STATE_INVALID");
             }
         }
 
         private static void ValidateRule(RuleNodeV1 rule, GameSnapshotV1 snapshot, int applyTurn, RuleValidationResult result)
         {
             if (rule == null) { result.errors.Add("RULE_NULL"); return; }
-            ValidateRuleContent(rule, snapshot, "RULE", result);
+            ValidateRuleContent(rule, snapshot, "RULE", result, true);
             var id = SafeId(rule.id);
             if (rule.appliedTurn != 0 && rule.appliedTurn != applyTurn) result.errors.Add("RULE_APPLY_TURN_MISMATCH:" + id);
         }
@@ -340,28 +498,45 @@ namespace OnlyMyGame.Core
         private static void ValidateStoredRule(RuleNodeV1 rule, GameSnapshotV1 snapshot, RuleValidationResult result)
         {
             if (rule == null) { result.errors.Add("SNAPSHOT_RULE_NULL"); return; }
-            ValidateRuleContent(rule, snapshot, "SNAPSHOT_RULE", result);
+            ValidateRuleContent(rule, snapshot, "SNAPSHOT_RULE", result, false);
             var id = SafeId(rule.id);
             // Existing rules may be expired or may be scheduled for a future trigger. Only
             // impossible negative/far-future application turns are rejected here.
             if (rule.appliedTurn < 0 || (long)rule.appliedTurn > (long)snapshot.turn + RuleLimits.MaxScheduleDelay) result.errors.Add("STORED_RULE_APPLY_TURN_INVALID:" + id);
         }
 
-        private static void ValidateRuleContent(RuleNodeV1 rule, GameSnapshotV1 snapshot, string source, RuleValidationResult result)
+        private static void ValidateRuleContent(
+            RuleNodeV1 rule,
+            GameSnapshotV1 snapshot,
+            string source,
+            RuleValidationResult result,
+            bool requireCurrentWorldReferences)
         {
+            var currentWorldBudget = requireCurrentWorldReferences
+                ? new RuleValidationWorkBudget(RuleLimits.MaxConditionWorkPerEvaluation)
+                : null;
             var id = SafeId(rule.id);
             if (!IsBoundedText(rule.id, RuleLimits.MaxIdentifierLength, false) || !IsBoundedText(rule.name, RuleLimits.MaxNameLength, false)) result.errors.Add("RULE_ID_OR_NAME:" + id);
             if (!IsBoundedText(rule.description, RuleLimits.MaxDescriptionLength, false) || !IsBoundedText(rule.worldCue, RuleLimits.MaxNameLength, true)) result.errors.Add("RULE_TEXT_LIMIT:" + id);
             if (!Enum.IsDefined(typeof(EventType), rule.trigger)) result.errors.Add("RULE_TRIGGER_INVALID:" + id);
             if (rule.durationTurns < 1 || rule.durationTurns > 30) result.errors.Add("RULE_DURATION_INVALID:" + id);
             if (!IsBoundedStateValue(rule.priority)) result.errors.Add("RULE_PRIORITY_INVALID:" + id);
-            ValidateConditionTree(rule.condition, snapshot, source + ":" + id, result);
-            ValidateEffects(rule.effects, snapshot, source + ":" + id, result);
+            ValidateConditionTree(rule.condition, snapshot, source + ":" + id, result, null, requireCurrentWorldReferences, currentWorldBudget);
+            ValidateEffects(rule.effects, snapshot, source + ":" + id, result, null, requireCurrentWorldReferences, currentWorldBudget);
+            RuleExpressionValidator.ValidateRule(rule, snapshot, source + ":" + id, result.errors, requireCurrentWorldReferences, currentWorldBudget);
         }
 
-        private static void ValidateDynamicAction(DynamicActionV1 action, GameSnapshotV1 snapshot, RuleValidationResult result)
+        private static void ValidateDynamicAction(
+            DynamicActionV1 action,
+            GameSnapshotV1 snapshot,
+            RuleValidationResult result,
+            bool requireTargetCandidate,
+            bool requireCurrentWorldReferences)
         {
             if (action == null) { result.errors.Add("DYNAMIC_ACTION_NULL"); return; }
+            var currentWorldBudget = requireCurrentWorldReferences
+                ? new RuleValidationWorkBudget(RuleLimits.MaxConditionWorkPerEvaluation)
+                : null;
             var id = SafeId(action.id);
             if (!IsBoundedText(action.id, RuleLimits.MaxIdentifierLength, false) || !IsBoundedText(action.name, RuleLimits.MaxNameLength, false)) result.errors.Add("DYNAMIC_ACTION_ID_OR_NAME:" + id);
             if (!IsBoundedText(action.description, RuleLimits.MaxDescriptionLength, false)) result.errors.Add("DYNAMIC_ACTION_TEXT_LIMIT:" + id);
@@ -372,8 +547,10 @@ namespace OnlyMyGame.Core
             // place it within the configured scheduling window ahead of the snapshot.
             if (action.availableTurn < 0 || (long)action.availableTurn > (long)snapshot.turn + RuleLimits.MaxScheduleDelay) result.errors.Add("DYNAMIC_ACTION_AVAILABLE_TURN:" + id);
             if (action.spCost == 0 && action.resourceAmount == 0 && action.cooldown == 0) result.errors.Add("DYNAMIC_ACTION_FREE_REPEAT:" + id);
-            ValidateConditionTree(action.condition, snapshot, "ACTION:" + id, result);
-            ValidateEffects(action.effects, snapshot, "ACTION:" + id, result);
+            DynamicActionTargeting.ValidateSelectorAndBindings(action, snapshot, result.errors, "ACTION:" + id, requireTargetCandidate);
+            ValidateConditionTree(action.condition, snapshot, "ACTION:" + id, result, action.targetSelector, requireCurrentWorldReferences, currentWorldBudget);
+            ValidateEffects(action.effects, snapshot, "ACTION:" + id, result, action.targetSelector, requireCurrentWorldReferences, currentWorldBudget);
+            RuleExpressionValidator.ValidateAction(action, snapshot, "ACTION:" + id, result.errors, requireCurrentWorldReferences, currentWorldBudget);
         }
 
         private static void ValidateVictory(VictoryContractV1 goal, GameSnapshotV1 snapshot, RuleValidationResult result)
@@ -415,15 +592,29 @@ namespace OnlyMyGame.Core
                 result.errors.Add("STORED_VICTORY_TIMELINE_INVALID:" + id);
         }
 
-        private static void ValidateEffects(List<EffectNode> effects, GameSnapshotV1 snapshot, string source, RuleValidationResult result)
+        private static void ValidateEffects(
+            List<EffectNode> effects,
+            GameSnapshotV1 snapshot,
+            string source,
+            RuleValidationResult result,
+            DynamicTargetSelectorV1 targetSelector = null,
+            bool requireCurrentWorldReferences = true,
+            RuleValidationWorkBudget currentWorldBudget = null)
         {
             if (effects == null) { result.errors.Add("EFFECTS_NULL:" + source); return; }
             if (effects.Count < 1 || effects.Count > RuleLimits.MaxEffectsPerRule) result.errors.Add("EFFECT_COUNT:" + source);
             var inspectCount = Math.Min(effects.Count, RuleLimits.MaxEffectsPerRule + 1);
-            for (var i = 0; i < inspectCount; i++) ValidateEffect(effects[i], snapshot, source + ":" + i, result);
+            for (var i = 0; i < inspectCount; i++) ValidateEffect(effects[i], snapshot, source + ":" + i, result, targetSelector, requireCurrentWorldReferences, currentWorldBudget);
         }
 
-        private static void ValidateEffect(EffectNode effect, GameSnapshotV1 snapshot, string source, RuleValidationResult result)
+        private static void ValidateEffect(
+            EffectNode effect,
+            GameSnapshotV1 snapshot,
+            string source,
+            RuleValidationResult result,
+            DynamicTargetSelectorV1 targetSelector,
+            bool requireCurrentWorldReferences,
+            RuleValidationWorkBudget currentWorldBudget)
         {
             if (effect == null) { result.errors.Add("EFFECT_NULL:" + source); return; }
             if (!Enum.IsDefined(typeof(EffectType), effect.type)) { result.errors.Add("EFFECT_TYPE_INVALID:" + source); return; }
@@ -444,7 +635,9 @@ namespace OnlyMyGame.Core
                     if (!IsBoundedText(effect.key, RuleLimits.MaxIdentifierLength, false) || !IsBoundedStateValue(effect.amount)) result.errors.Add("STATUS_EFFECT_INVALID:" + source);
                     break;
                 case EffectType.Spawn:
-                    if (effect.amount < 1 || effect.amount > RuleLimits.MaxRuleSpawnsPerTurn || !IsFactionTarget(effect.target, snapshot)) result.errors.Add("SPAWN_EFFECT_INVALID:" + source);
+                    if (effect.amount < 1 || effect.amount > RuleLimits.MaxRuleSpawnsPerTurn ||
+                        !(string.Equals(effect.target, DynamicActionTargeting.OwnerToken, StringComparison.Ordinal) && targetSelector != null && targetSelector.kind != DynamicTargetKind.None) &&
+                        !(requireCurrentWorldReferences ? IsFactionTarget(effect.target, snapshot, currentWorldBudget) : IsFactionTargetShapeSafe(effect.target))) result.errors.Add("SPAWN_EFFECT_INVALID:" + source);
                     break;
                 case EffectType.UnlockAction:
                     if (!IsBoundedText(effect.key, RuleLimits.MaxNameLength, false) || effect.amount < 1 || effect.amount > 10) result.errors.Add("UNLOCK_EFFECT_INVALID:" + source);
@@ -454,15 +647,42 @@ namespace OnlyMyGame.Core
                     break;
                 case EffectType.FactionSwitch:
                 {
-                    var targetUnit = int.TryParse(effect.target, out var unitId) ? (snapshot.entities ?? new List<UnitState>()).FirstOrDefault(u => u != null && u.id == unitId) : null;
-                    var targetFactionExists = int.TryParse(effect.key, out var factionId) && (snapshot.factions ?? new List<FactionState>()).Any(f => f != null && f.id == factionId);
-                    if (string.Equals(effect.target, "player", StringComparison.OrdinalIgnoreCase) || targetUnit == null || targetUnit.factionId == 1 || !targetFactionExists) result.errors.Add("FACTION_SWITCH_EFFECT_INVALID:" + source);
+                    var dynamicTarget = string.Equals(effect.target, DynamicActionTargeting.TargetToken, StringComparison.Ordinal) && targetSelector?.kind == DynamicTargetKind.Unit;
+                    var targetIdShape = int.TryParse(effect.target, out var unitId) && unitId > 0 && unitId <= RuleLimits.MaxStateMagnitude;
+                    var factionIdShape = int.TryParse(effect.key, out var factionId) && factionId > 0 && factionId <= RuleLimits.MaxStateMagnitude;
+                    if (!requireCurrentWorldReferences)
+                    {
+                        if (!dynamicTarget && !targetIdShape || !factionIdShape) result.errors.Add("FACTION_SWITCH_EFFECT_INVALID:" + source);
+                        break;
+                    }
+                    var referenceWork = (long)(snapshot.factions?.Count ?? 0) +
+                                        (dynamicTarget ? 0 : snapshot.entities?.Count ?? 0);
+                    if (currentWorldBudget == null || !currentWorldBudget.TrySpend(referenceWork))
+                    {
+                        result.errors.Add("CURRENT_WORLD_WORK_LIMIT:" + source);
+                        break;
+                    }
+                    var targetUnit = targetIdShape ? (snapshot.entities ?? new List<UnitState>()).FirstOrDefault(u => u != null && u.id == unitId) : null;
+                    var targetFactionExists = factionIdShape && (snapshot.factions ?? new List<FactionState>()).Any(f => f != null && f.id == factionId);
+                    if (string.Equals(effect.target, "player", StringComparison.OrdinalIgnoreCase) || !dynamicTarget && (targetUnit == null || targetUnit.factionId == 1) || !targetFactionExists) result.errors.Add("FACTION_SWITCH_EFFECT_INVALID:" + source);
                     break;
                 }
+                case EffectType.TypedState:
+                    if (effect.stateMutation == null) result.errors.Add("TYPED_STATE_EFFECT_INVALID:" + source);
+                    break;
             }
+            if (requireCurrentWorldReferences && currentWorldBudget?.Exhausted == true && !result.errors.Contains("CURRENT_WORLD_WORK_LIMIT:" + source))
+                result.errors.Add("CURRENT_WORLD_WORK_LIMIT:" + source);
         }
 
-        private static void ValidateConditionTree(ConditionNode root, GameSnapshotV1 snapshot, string source, RuleValidationResult result)
+        private static void ValidateConditionTree(
+            ConditionNode root,
+            GameSnapshotV1 snapshot,
+            string source,
+            RuleValidationResult result,
+            DynamicTargetSelectorV1 targetSelector = null,
+            bool requireCurrentWorldReferences = true,
+            RuleValidationWorkBudget currentWorldBudget = null)
         {
             if (root == null) { result.errors.Add("CONDITION_ROOT_NULL:" + source); return; }
             var pending = new Stack<Tuple<ConditionNode, int>>();
@@ -480,7 +700,7 @@ namespace OnlyMyGame.Core
                 count++;
                 if (count > RuleLimits.MaxConditionNodes) { result.errors.Add("AST_NODE_LIMIT:" + source); break; }
                 if (depth > RuleLimits.MaxConditionDepth) result.errors.Add("AST_DEPTH_LIMIT:" + source);
-                ValidateConditionNode(node, snapshot, source, result);
+                ValidateConditionNode(node, snapshot, source, result, targetSelector, requireCurrentWorldReferences, currentWorldBudget);
                 if (node.all == null) continue;
                 for (var i = node.all.Count - 1; i >= 0; i--)
                 {
@@ -496,25 +716,34 @@ namespace OnlyMyGame.Core
             }
         }
 
-        private static void ValidateConditionNode(ConditionNode node, GameSnapshotV1 snapshot, string source, RuleValidationResult result)
+        private static void ValidateConditionNode(
+            ConditionNode node,
+            GameSnapshotV1 snapshot,
+            string source,
+            RuleValidationResult result,
+            DynamicTargetSelectorV1 targetSelector,
+            bool requireCurrentWorldReferences,
+            RuleValidationWorkBudget currentWorldBudget)
         {
             if (!Enum.IsDefined(typeof(CompareOp), node.op)) { result.errors.Add("CONDITION_OP_INVALID:" + source); return; }
             if (node.op == CompareOp.HasTag)
             {
-                if (!IsBoundedText(node.text, RuleLimits.MaxIdentifierLength, false) || !IsValidTagSelector(node.left, snapshot)) result.errors.Add("HAS_TAG_CONDITION_INVALID:" + source);
+                if (!IsBoundedText(node.text, RuleLimits.MaxIdentifierLength, false) || !IsValidTagSelector(node.left, snapshot, targetSelector, requireCurrentWorldReferences, currentWorldBudget)) result.errors.Add("HAS_TAG_CONDITION_INVALID:" + source);
             }
             else if (node.op == CompareOp.OwnerIs)
             {
-                if (!IsValidOwner(node.value, snapshot) || !IsValidTileSelector(node.left, node.text, snapshot)) result.errors.Add("OWNER_CONDITION_INVALID:" + source);
+                if (!IsValidOwner(node.value, snapshot, requireCurrentWorldReferences, currentWorldBudget) || !IsValidTileSelector(node.left, node.text, snapshot, targetSelector, requireCurrentWorldReferences, currentWorldBudget)) result.errors.Add("OWNER_CONDITION_INVALID:" + source);
             }
             else if (node.op != CompareOp.Always && !IsBoundedText(node.left, RuleLimits.MaxIdentifierLength, false)) result.errors.Add("NUMERIC_CONDITION_LEFT_INVALID:" + source);
             if (!IsBoundedStateValue(node.value)) result.errors.Add("CONDITION_VALUE_LIMIT:" + source);
+            if (requireCurrentWorldReferences && currentWorldBudget?.Exhausted == true && !result.errors.Contains("CURRENT_WORLD_WORK_LIMIT:" + source))
+                result.errors.Add("CURRENT_WORLD_WORK_LIMIT:" + source);
         }
 
         private static bool IsKnownProgressKey(string key)
         {
             if (string.IsNullOrEmpty(key)) return false;
-            var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "turn", "kills", "buildings", "coin", "move", "gather", "hunt", "attack", "trade", "persuade", "hire", "build", "upgrade" };
+            var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "turn", "kills", "buildings", "coin", "territory", "alliances", "move", "gather", "hunt", "attack", "trade", "persuade", "hire", "build", "upgrade", "capture" };
             return known.Contains(key);
         }
 
@@ -522,12 +751,33 @@ namespace OnlyMyGame.Core
         {
             foreach (var goal in set.victoryContracts ?? new List<VictoryContractV1>())
             {
-                if (goal == null || !IsKnownProgressKey(goal.progressKey)) return false;
-                var current = GameRules.Progress(snapshot, goal.progressKey);
-                var perTurn = MaxProgressPerTurn(goal.progressKey, snapshot);
-                if ((long)goal.target > (long)current + perTurn * 6L) return false;
+                if (!CanReachVictoryInSixTurns(goal, snapshot)) return false;
             }
-            return true;
+
+            // It is not enough for this response's optional contracts to be valid:
+            // after applying replacements, the run must still expose at least one
+            // reachable route to victory. Otherwise an old impossible contract can
+            // survive forever while every subsequent response remains superficially
+            // valid by omitting victoryContracts.
+            var effective = (snapshot.victoryContracts ?? new List<VictoryContractV1>())
+                .Where(goal => goal != null)
+                .ToDictionary(goal => goal.id ?? string.Empty, goal => goal, StringComparer.Ordinal);
+            foreach (var goal in set.victoryContracts ?? new List<VictoryContractV1>())
+                if (goal != null) effective[goal.id ?? string.Empty] = goal;
+
+            if (effective.Count == 0) return snapshot.turn < 2;
+            return effective.Values.Any(goal => CanReachVictoryInSixTurns(goal, snapshot));
+        }
+
+        private static bool CanReachVictoryInSixTurns(VictoryContractV1 goal, GameSnapshotV1 snapshot)
+        {
+            if (goal == null || !IsKnownProgressKey(goal.progressKey)) return false;
+            var current = GameRules.Progress(snapshot, goal.progressKey);
+            var perTurn = MaxProgressPerTurn(goal.progressKey, snapshot);
+            var sixTurnMaximum = (long)current + perTurn * 6L;
+            if (TryGetProgressCeiling(goal.progressKey, snapshot, current, out var hardCeiling))
+                sixTurnMaximum = Math.Min(sixTurnMaximum, hardCeiling);
+            return (long)goal.target <= sixTurnMaximum;
         }
 
         private static int MaxProgressPerTurn(string key, GameSnapshotV1 snapshot)
@@ -536,9 +786,70 @@ namespace OnlyMyGame.Core
             var player = (snapshot.factions ?? new List<FactionState>()).FirstOrDefault(f => f != null && f.kind == FactionKind.Player);
             var sp = Math.Max(3, player?.maxSp ?? 10);
             if (string.Equals(key, "move", StringComparison.OrdinalIgnoreCase)) return sp;
+            if (string.Equals(key, "territory", StringComparison.OrdinalIgnoreCase) || string.Equals(key, "alliances", StringComparison.OrdinalIgnoreCase) || string.Equals(key, "capture", StringComparison.OrdinalIgnoreCase)) return Math.Max(1, sp / GameRules.CaptureSpCost);
             if (string.Equals(key, "buildings", StringComparison.OrdinalIgnoreCase) || string.Equals(key, "build", StringComparison.OrdinalIgnoreCase) || string.Equals(key, "upgrade", StringComparison.OrdinalIgnoreCase)) return Math.Max(1, sp / 3);
             if (string.Equals(key, "coin", StringComparison.OrdinalIgnoreCase)) return Math.Max(2, sp);
             return Math.Max(1, sp / 2);
+        }
+
+        private static bool TryGetProgressCeiling(string key, GameSnapshotV1 snapshot, int current, out long ceiling)
+        {
+            ceiling = RuleLimits.MaxStateMagnitude;
+            if (string.Equals(key, "territory", StringComparison.OrdinalIgnoreCase))
+            {
+                ceiling = (snapshot.map ?? new List<TileState>()).Count(tile => tile != null);
+                return true;
+            }
+            if (string.Equals(key, "alliances", StringComparison.OrdinalIgnoreCase))
+            {
+                var factions = snapshot.factions ?? new List<FactionState>();
+                var livingTargetFactions = new HashSet<int>((snapshot.entities ?? new List<UnitState>())
+                    .Where(unit => unit != null && unit.alive && unit.factionId != 1)
+                    .Select(unit => unit.factionId));
+                var player = factions.FirstOrDefault(faction => faction != null && faction.kind == FactionKind.Player);
+                var hasPlayerActor = (snapshot.entities ?? new List<UnitState>()).Any(unit => unit != null && unit.alive && unit.factionId == 1);
+                var persuasionBudget = hasPlayerActor ? Math.Max(0, player?.maxSp ?? 0) / GameRules.CommandCost(CommandType.Persuade) * 6 : 0;
+                var reachableAdditions = 0;
+                foreach (var requiredActions in factions
+                    .Where(faction => faction != null && faction.kind != FactionKind.Player && faction.relationToPlayer < 60 && livingTargetFactions.Contains(faction.id))
+                    .Select(faction => (Math.Max(0, 60 - faction.relationToPlayer) + 7) / 8)
+                    .OrderBy(actions => actions))
+                {
+                    if (requiredActions > persuasionBudget) break;
+                    persuasionBudget -= requiredActions;
+                    reachableAdditions++;
+                }
+                ceiling = Math.Min(factions.Count(faction => faction != null && faction.kind != FactionKind.Player), (long)Math.Max(0, current) + reachableAdditions);
+                return true;
+            }
+            if (string.Equals(key, "capture", StringComparison.OrdinalIgnoreCase))
+            {
+                var remainingCapturableTiles = (snapshot.map ?? new List<TileState>()).Count(tile => tile != null && tile.owner != 1);
+                ceiling = Math.Min(RuleLimits.MaxStateMagnitude, (long)Math.Max(0, current) + remainingCapturableTiles);
+                return true;
+            }
+            if (string.Equals(key, "kills", StringComparison.OrdinalIgnoreCase))
+            {
+                var remainingEnemies = (snapshot.entities ?? new List<UnitState>()).Count(unit => unit != null && unit.alive && unit.factionId != 1);
+                ceiling = Math.Min(RuleLimits.MaxStateMagnitude, (long)Math.Max(0, current) + remainingEnemies);
+                return true;
+            }
+            if (string.Equals(key, "coin", StringComparison.OrdinalIgnoreCase))
+            {
+                var player = (snapshot.factions ?? new List<FactionState>()).FirstOrDefault(faction => faction != null && faction.kind == FactionKind.Player);
+                ceiling = Math.Max(0, player?.resources?.maxCoin ?? 0);
+                return true;
+            }
+            if (string.Equals(key, "buildings", StringComparison.OrdinalIgnoreCase))
+            {
+                var buildings = (snapshot.buildings ?? new List<BuildingState>()).Where(building => building != null).ToList();
+                var occupied = new HashSet<HexCoord>(buildings.Select(building => building.position));
+                var emptyMapTiles = (snapshot.map ?? new List<TileState>()).Count(tile => tile != null && !occupied.Contains(tile.position));
+                var remainingCapacity = Math.Max(0, RuleLimits.MaxBuildings - buildings.Count);
+                ceiling = Math.Min(RuleLimits.MaxStateMagnitude, (long)Math.Max(0, current) + Math.Min(remainingCapacity, emptyMapTiles));
+                return true;
+            }
+            return false;
         }
 
         private static long SumSpawnAmounts(IEnumerable<EffectNode> effects)
@@ -577,30 +888,65 @@ namespace OnlyMyGame.Core
                    string.Equals(left.worldCue, right.worldCue, StringComparison.Ordinal);
         }
 
-        private static bool IsFactionTarget(string target, GameSnapshotV1 snapshot)
+        private static bool IsFactionTarget(string target, GameSnapshotV1 snapshot, RuleValidationWorkBudget currentWorldBudget)
         {
+            if (currentWorldBudget == null || !currentWorldBudget.TrySpend(snapshot.factions?.Count ?? 0)) return false;
             if (string.IsNullOrEmpty(target) || string.Equals(target, "player", StringComparison.OrdinalIgnoreCase)) return (snapshot.factions ?? new List<FactionState>()).Any(f => f != null && f.kind == FactionKind.Player);
             if (int.TryParse(target, out var id)) return (snapshot.factions ?? new List<FactionState>()).Any(f => f != null && f.id == id);
             return (snapshot.factions ?? new List<FactionState>()).Any(f => f != null && string.Equals(f.kind.ToString(), target, StringComparison.OrdinalIgnoreCase));
         }
 
-        private static bool IsValidTagSelector(string selector, GameSnapshotV1 snapshot)
+        private static bool IsFactionTargetShapeSafe(string target)
         {
+            if (string.IsNullOrEmpty(target) || string.Equals(target, "player", StringComparison.OrdinalIgnoreCase)) return true;
+            if (int.TryParse(target, out var id)) return id > 0 && id <= RuleLimits.MaxStateMagnitude;
+            return Enum.TryParse<FactionKind>(target, true, out var kind) && Enum.IsDefined(typeof(FactionKind), kind);
+        }
+
+        private static bool IsValidTagSelector(
+            string selector,
+            GameSnapshotV1 snapshot,
+            DynamicTargetSelectorV1 targetSelector,
+            bool requireCurrentWorldReferences,
+            RuleValidationWorkBudget currentWorldBudget)
+        {
+            if (DynamicActionTargeting.IsTagBindingSelector(selector, targetSelector)) return true;
             if (string.IsNullOrEmpty(selector) || string.Equals(selector, "any", StringComparison.OrdinalIgnoreCase) || string.Equals(selector, "player", StringComparison.OrdinalIgnoreCase)) return true;
-            if (TryParseSelectorId(selector, "unit:", out var unitId)) return (snapshot.entities ?? new List<UnitState>()).Any(u => u != null && u.id == unitId);
-            if (TryParseSelectorId(selector, "faction:", out var factionId)) return (snapshot.factions ?? new List<FactionState>()).Any(f => f != null && f.id == factionId);
+            // Exact unit selectors are syntax-checked without confirming hidden
+            // existence; otherwise validation retries become an ID oracle.
+            if (TryParseSelectorId(selector, "unit:", out var unitId)) return unitId > 0 && unitId <= RuleLimits.MaxStateMagnitude;
+            if (TryParseSelectorId(selector, "faction:", out var factionId))
+                return factionId > 0 && factionId <= RuleLimits.MaxStateMagnitude &&
+                       (!requireCurrentWorldReferences || currentWorldBudget != null && currentWorldBudget.TrySpend(snapshot.factions?.Count ?? 0) &&
+                        (snapshot.factions ?? new List<FactionState>()).Any(f => f != null && f.id == factionId));
             return false;
         }
 
-        private static bool IsValidTileSelector(string left, string text, GameSnapshotV1 snapshot)
+        private static bool IsValidTileSelector(
+            string left,
+            string text,
+            GameSnapshotV1 snapshot,
+            DynamicTargetSelectorV1 targetSelector,
+            bool requireCurrentWorldReferences,
+            RuleValidationWorkBudget currentWorldBudget)
         {
             var selector = string.IsNullOrEmpty(left) ? text : left;
+            if (DynamicActionTargeting.IsOwnerBindingSelector(selector, targetSelector)) return true;
             if (string.IsNullOrEmpty(selector) || string.Equals(selector, "any", StringComparison.OrdinalIgnoreCase) || string.Equals(selector, "player_tile", StringComparison.OrdinalIgnoreCase)) return true;
             if (!TryParseHex(selector, out var coord)) return false;
-            return (snapshot.map ?? new List<TileState>()).Any(t => t != null && t.position.Equals(coord));
+            var bounded = Math.Abs((long)coord.q) <= RuleLimits.MaxStateMagnitude && Math.Abs((long)coord.r) <= RuleLimits.MaxStateMagnitude;
+            return bounded && (!requireCurrentWorldReferences || currentWorldBudget != null && currentWorldBudget.TrySpend(snapshot.map?.Count ?? 0) &&
+                               (snapshot.map ?? new List<TileState>()).Any(t => t != null && t.position.Equals(coord)));
         }
 
-        private static bool IsValidOwner(int owner, GameSnapshotV1 snapshot) => owner == 0 || (snapshot.factions ?? new List<FactionState>()).Any(f => f != null && f.id == owner);
+        private static bool IsValidOwner(
+            int owner,
+            GameSnapshotV1 snapshot,
+            bool requireCurrentWorldReferences,
+            RuleValidationWorkBudget currentWorldBudget) =>
+            owner == 0 || owner > 0 && owner <= RuleLimits.MaxStateMagnitude &&
+            (!requireCurrentWorldReferences || currentWorldBudget != null && currentWorldBudget.TrySpend(snapshot.factions?.Count ?? 0) &&
+             (snapshot.factions ?? new List<FactionState>()).Any(f => f != null && f.id == owner));
         private static bool IsValidResourceBag(ResourceBag resources) => resources != null &&
             IsValidResource(resources.food, resources.maxFood) && IsValidResource(resources.wood, resources.maxWood) &&
             IsValidResource(resources.stone, resources.maxStone) && IsValidResource(resources.iron, resources.maxIron) &&
@@ -632,6 +978,7 @@ namespace OnlyMyGame.Core
         private const int SpawnLimitFlag = 8;
         private const int StateLimitFlag = 16;
         private const int CollectionLimitFlag = 32;
+        private const int ConditionWorkLimitFlag = 64;
 
         public void Execute(EventType trigger, GameSnapshotV1 game, List<string> log)
         {
@@ -639,10 +986,22 @@ namespace OnlyMyGame.Core
             var budget = EnsureBudget(game);
             if (budget.dispatches >= RuleLimits.MaxRuleDispatchesPerTurn)
             {
-                LogLimit(budget, DispatchLimitFlag, log, "턴당 규칙 이벤트 실행 예산에 도달했습니다.");
+                LogLimit(budget, DispatchLimitFlag, log, "턴당 규칙 조건 시도 예산에 도달했습니다.");
                 return;
             }
-            budget.dispatches++;
+            if (budget.conditionWork >= RuleLimits.MaxRuleConditionWorkPerTurn)
+            {
+                LogLimit(budget, ConditionWorkLimitFlag, log, "턴당 규칙 조건 계산 예산에 도달했습니다.");
+                return;
+            }
+            // Definitions are a run-level registry, not a side effect of whichever
+            // owner rule happens to trigger first. Materialize/reset the complete
+            // active registry before any condition can reference it.
+            if (!RuleExpressionRuntime.EnsureActiveDefinitions(game))
+            {
+                LogLimit(budget, StateLimitFlag, log, "활성 규칙의 타입 상태 정의가 서로 충돌하거나 저장 한도를 넘었습니다.");
+                return;
+            }
             var rules = (game.activeRules ?? new List<RuleNodeV1>())
                 .Where(r => r != null && r.trigger == trigger && GameRules.IsRuleActive(r, game.turn))
                 .OrderByDescending(r => r.priority)
@@ -650,7 +1009,27 @@ namespace OnlyMyGame.Core
                 .ToList();
             foreach (var rule in rules)
             {
-                if (!ConditionMatches(rule.condition, game)) continue;
+                // Charge an attempt and its conservative selector/AST cost before
+                // evaluation. False conditions therefore consume the same bounded
+                // runway as true ones and cannot amplify work across repeated events.
+                if (budget.dispatches >= RuleLimits.MaxRuleDispatchesPerTurn)
+                {
+                    LogLimit(budget, DispatchLimitFlag, log, "턴당 규칙 조건 시도 예산에 도달했습니다.");
+                    break;
+                }
+                budget.dispatches++;
+                if (!TryReserveConditionWork(rule.condition, game, budget))
+                {
+                    LogLimit(budget, ConditionWorkLimitFlag, log, "턴당 규칙 조건 계산 예산에 도달했습니다.");
+                    break;
+                }
+                if (!ConditionMatchesReserved(rule.condition, game)) continue;
+                var effects = (rule.effects ?? new List<EffectNode>()).Take(RuleLimits.MaxEffectsPerRule + 1).ToList();
+                if (!CanApplyWorldRuleEffects(effects, game, budget))
+                {
+                    LogLimit(budget, StateLimitFlag, log, "규칙의 모든 효과를 안전하게 적용할 수 없어 이번 발동을 건너뛰었습니다.");
+                    continue;
+                }
                 // 모든 이벤트 호출을 합친 rule activation 수가 런타임 연쇄 실행 예산이다.
                 if (budget.activations >= RuleLimits.MaxRuleActivationsPerTurn)
                 {
@@ -658,7 +1037,7 @@ namespace OnlyMyGame.Core
                     break;
                 }
                 budget.activations++;
-                ApplyValidatedEffects(rule.effects, game, log, rule.name ?? rule.id ?? "규칙");
+                ApplyValidatedEffects(effects, game, log, rule.name ?? rule.id ?? "규칙");
                 if (budget.effects >= RuleLimits.MaxRuleEffectsPerTurn) return;
             }
         }
@@ -666,8 +1045,186 @@ namespace OnlyMyGame.Core
         public static bool ConditionMatches(ConditionNode condition, GameSnapshotV1 game)
         {
             if (game == null) return false;
+            if (!TryEstimateConditionWork(condition, game, out var work) || work > RuleLimits.MaxConditionWorkPerEvaluation) return false;
+            return ConditionMatchesReserved(condition, game);
+        }
+
+        public static bool TryConditionMatchesWithinBudget(ConditionNode condition, GameSnapshotV1 game, int availableWork, out bool matches, out int usedWork)
+        {
+            matches = false;
+            usedWork = 0;
+            var maximumWork = Math.Min(RuleLimits.MaxConditionWorkPerEvaluation, availableWork);
+            if (game == null || maximumWork < 1 || !TryEstimateConditionWork(condition, game, out usedWork, maximumWork) ||
+                usedWork > RuleLimits.MaxConditionWorkPerEvaluation || usedWork > availableWork) return false;
+            matches = ConditionMatchesReserved(condition, game);
+            return true;
+        }
+
+        private static bool ConditionMatchesReserved(ConditionNode condition, GameSnapshotV1 game)
+        {
             var visited = 0;
             return Matches(condition, game, 1, new HashSet<ConditionNode>(), ref visited);
+        }
+
+        private static bool TryReserveConditionWork(ConditionNode condition, GameSnapshotV1 game, RuleRuntimeBudget budget)
+        {
+            if (!TryEstimateConditionWork(condition, game, out var work) ||
+                work > RuleLimits.MaxConditionWorkPerEvaluation ||
+                work > RuleLimits.MaxRuleConditionWorkPerTurn - budget.conditionWork)
+            {
+                budget.conditionWork = RuleLimits.MaxRuleConditionWorkPerTurn;
+                return false;
+            }
+            budget.conditionWork += work;
+            return true;
+        }
+
+        private static bool TryEstimateConditionWork(
+            ConditionNode condition,
+            GameSnapshotV1 game,
+            out int work,
+            int maximumWork = RuleLimits.MaxConditionWorkPerEvaluation)
+        {
+            var estimator = new ConditionWorkEstimator(game, maximumWork);
+            return estimator.TryEstimate(condition, out work);
+        }
+
+        private sealed class ConditionWorkEstimator
+        {
+            private readonly GameSnapshotV1 game;
+            private readonly int maximumWork;
+            private readonly HashSet<object> path = new HashSet<object>();
+            private int nodes;
+            private long work;
+
+            public ConditionWorkEstimator(GameSnapshotV1 game, int maximumWork)
+            {
+                this.game = game;
+                this.maximumWork = Math.Max(0, Math.Min(RuleLimits.MaxConditionWorkPerEvaluation, maximumWork));
+            }
+
+            public bool TryEstimate(ConditionNode condition, out int estimated)
+            {
+                var valid = VisitCondition(condition, 1);
+                estimated = (int)Math.Min((long)maximumWork + 1L, Math.Max(1L, work));
+                return valid;
+            }
+
+            private bool VisitCondition(ConditionNode node, int depth)
+            {
+                if (node == null) { AddWork(1); return WithinEvaluationBudget; }
+                if (!Enter(node, depth)) return false;
+                try
+                {
+                    if (node.predicate != null)
+                    {
+                        if (!VisitPredicate(node.predicate, depth + 1)) return false;
+                    }
+                    else if (!Enum.IsDefined(typeof(CompareOp), node.op)) return false;
+                    else if (node.op == CompareOp.HasTag) AddWork(HasTagCost());
+                    else if (node.op == CompareOp.OwnerIs) AddWork(OwnerCost());
+                    else if (node.op != CompareOp.Always) AddWork(LegacyNumericCost());
+                    if (!WithinEvaluationBudget) return false;
+
+                    foreach (var child in node.all ?? new List<ConditionNode>())
+                        if (!VisitCondition(child, depth + 1)) return false;
+                    return true;
+                }
+                finally { path.Remove(node); }
+            }
+
+            private bool VisitPredicate(PredicateExpressionV1 predicate, int depth)
+            {
+                if (!Enter(predicate, depth) || !Enum.IsDefined(typeof(PredicateExpressionOp), predicate.op)) return false;
+                try
+                {
+                    if (predicate.op == PredicateExpressionOp.All || predicate.op == PredicateExpressionOp.Any)
+                    {
+                        var children = predicate.children ?? new List<PredicateExpressionV1>();
+                        if (children.Count < 1) return false;
+                        foreach (var child in children) if (!VisitPredicate(child, depth + 1)) return false;
+                    }
+                    else if (predicate.op == PredicateExpressionOp.Not)
+                    {
+                        if (!VisitPredicate(predicate.child, depth + 1)) return false;
+                    }
+                    else if (predicate.op == PredicateExpressionOp.BoolState) AddWork(StateCost());
+                    else if (predicate.op == PredicateExpressionOp.SetContains) AddWork(StateCost() + RuleLimits.MaxStateSetElements);
+                    else
+                    {
+                        if (!VisitNumber(predicate.left, depth + 1) || !VisitNumber(predicate.right, depth + 1)) return false;
+                    }
+                    return WithinEvaluationBudget;
+                }
+                finally { path.Remove(predicate); }
+            }
+
+            private bool VisitNumber(NumberExpressionV1 expression, int depth)
+            {
+                if (!Enter(expression, depth) || !Enum.IsDefined(typeof(NumberExpressionOp), expression.op)) return false;
+                try
+                {
+                    if (expression.op == NumberExpressionOp.State) AddWork(StateCost());
+                    else if (expression.op == NumberExpressionOp.Add || expression.op == NumberExpressionOp.Subtract || expression.op == NumberExpressionOp.Multiply || expression.op == NumberExpressionOp.Divide)
+                    {
+                        if (!VisitNumber(expression.left, depth + 1) || !VisitNumber(expression.right, depth + 1)) return false;
+                    }
+                    else if (expression.op == NumberExpressionOp.CountUnits) AddWork(UnitSelectorCost());
+                    else if (expression.op == NumberExpressionOp.CountBuildings) AddWork(BuildingSelectorCost());
+                    else if (expression.op == NumberExpressionOp.CountTiles) AddWork(TileSelectorCost());
+                    else if (expression.op == NumberExpressionOp.Distance) AddWork(2L * PositionSelectorCost());
+                    else if (expression.op == NumberExpressionOp.RecentActionRatio) AddWork(RecentActionCost());
+                    return WithinEvaluationBudget;
+                }
+                finally { path.Remove(expression); }
+            }
+
+            private bool Enter(object node, int depth)
+            {
+                if (node == null || depth > RuleLimits.MaxConditionDepth || nodes >= RuleLimits.MaxConditionNodes || !path.Add(node)) return false;
+                nodes++;
+                AddWork(1);
+                if (WithinEvaluationBudget) return true;
+                path.Remove(node);
+                return false;
+            }
+
+            private void AddWork(long amount)
+            {
+                work = Math.Min((long)maximumWork + 1L, work + Math.Max(0L, amount));
+            }
+
+            private bool WithinEvaluationBudget => work <= maximumWork;
+
+            private long UnitSelectorCost() => CollectionCost(game.entities, RuleLimits.MaxEntities) + CollectionCost(game.map, RuleLimits.MaxMapTiles) + CollectionCost(game.factions, RuleLimits.MaxFactions);
+            private long BuildingSelectorCost() => CollectionCost(game.buildings, RuleLimits.MaxBuildings) + CollectionCost(game.map, RuleLimits.MaxMapTiles) + CollectionCost(game.factions, RuleLimits.MaxFactions);
+            private long TileSelectorCost() => 2L * CollectionCost(game.map, RuleLimits.MaxMapTiles) + CollectionCost(game.factions, RuleLimits.MaxFactions);
+            private long PositionSelectorCost() => CollectionCost(game.entities, RuleLimits.MaxEntities) + CollectionCost(game.buildings, RuleLimits.MaxBuildings) + CollectionCost(game.map, RuleLimits.MaxMapTiles);
+            private long OwnerCost() => CollectionCost(game.entities, RuleLimits.MaxEntities) + CollectionCost(game.map, RuleLimits.MaxMapTiles);
+            private long LegacyNumericCost() => CollectionCost(game.factions, RuleLimits.MaxFactions) + CollectionCost(game.ruleState, RuleLimits.MaxStateVariables);
+            private long StateCost() => CollectionCost(game.typedRuleState, RuleLimits.MaxStateVariables) + CollectionCost(game.factions, RuleLimits.MaxFactions) + CollectionCost(game.entities, RuleLimits.MaxEntities) + CollectionCost(game.buildings, RuleLimits.MaxBuildings) + CollectionCost(game.map, RuleLimits.MaxMapTiles);
+            private long RecentActionCost() => CollectionCost(game.recentActionStats, RuleLimits.MaxRecentActionEntries);
+
+            private long HasTagCost()
+            {
+                var entities = game.entities ?? new List<UnitState>();
+                if (entities.Count > RuleLimits.MaxEntities) return (long)maximumWork + 1L;
+                long total = CollectionCost(game.map, RuleLimits.MaxMapTiles) + entities.Count;
+                foreach (var unit in entities)
+                {
+                    var tags = unit?.tags;
+                    if ((tags?.Count ?? 0) > RuleLimits.MaxTagsPerUnit) return (long)maximumWork + 1L;
+                    total += tags?.Count ?? 0;
+                    if (total > maximumWork) return (long)maximumWork + 1L;
+                }
+                return total;
+            }
+
+            private long CollectionCost<T>(ICollection<T> collection, int maximum)
+            {
+                if (collection == null) return 0;
+                return collection.Count > maximum ? (long)maximumWork + 1L : collection.Count;
+            }
         }
 
         public int ApplyValidatedEffects(IEnumerable<EffectNode> effects, GameSnapshotV1 game, List<string> log, string source)
@@ -695,13 +1252,156 @@ namespace OnlyMyGame.Core
             return applied;
         }
 
+        private bool CanApplyWorldRuleEffects(IReadOnlyList<EffectNode> effects, GameSnapshotV1 game, RuleRuntimeBudget budget)
+        {
+            if (effects == null || effects.Count < 1 || effects.Count > RuleLimits.MaxEffectsPerRule) return false;
+            var hasTypedMutation = effects.Any(effect => effect?.type == EffectType.TypedState);
+            // A typed expression can observe world mutations earlier in the same
+            // effect list (for example Spawn followed by Add(CountUnits)). Replaying
+            // only typed state against the original world therefore is not a valid
+            // atomicity check. Simulate the complete ordered slice on a detached
+            // snapshot and require every effect to succeed before touching live state.
+            // Rules without typed mutations retain their documented capped/partial
+            // legacy behavior.
+            if (hasTypedMutation && (long)budget.effects + effects.Count > RuleLimits.MaxRuleEffectsPerTurn) return false;
+            if (hasTypedMutation)
+            {
+                var shadow = CloneForAtomicPreflight(game, budget);
+                var shadowBudget = shadow.ruleBudget;
+                var shadowLog = new List<string>();
+                foreach (var effect in effects)
+                {
+                    if (shadowBudget.effects >= RuleLimits.MaxRuleEffectsPerTurn) return false;
+                    shadowBudget.effects++;
+                    if (!Apply(effect, shadow, shadowLog, "원자성 사전 검사", shadowBudget)) return false;
+                }
+            }
+
+            var legacy = game.ruleState ?? new List<RuleStateEntry>();
+            var newLegacyKeys = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var effect in effects.Where(effect => effect?.type == EffectType.Status))
+                if (!legacy.Any(entry => entry != null && string.Equals(entry.key, effect.key, StringComparison.Ordinal))) newLegacyKeys.Add(effect.key);
+            if (legacy.Count + (game.typedRuleState?.Count ?? 0) + newLegacyKeys.Count > RuleLimits.MaxStateVariables) return false;
+
+            return true;
+        }
+
+        private static GameSnapshotV1 CloneForAtomicPreflight(GameSnapshotV1 game, RuleRuntimeBudget budget)
+        {
+            return new GameSnapshotV1
+            {
+                runId = game.runId,
+                turn = game.turn,
+                seed = game.seed,
+                luck = game.luck,
+                playerKills = game.playerKills,
+                outcome = game.outcome,
+                phase = game.phase,
+                completedContractId = game.completedContractId,
+                planningPrepared = game.planningPrepared,
+                map = (game.map ?? new List<TileState>()).Select(tile => tile == null ? null : new TileState
+                {
+                    position = tile.position,
+                    terrain = tile.terrain,
+                    resource = tile.resource,
+                    amount = tile.amount,
+                    owner = tile.owner,
+                    explored = tile.explored,
+                    visible = tile.visible
+                }).ToList(),
+                entities = (game.entities ?? new List<UnitState>()).Select(unit => unit == null ? null : new UnitState
+                {
+                    id = unit.id,
+                    factionId = unit.factionId,
+                    position = unit.position,
+                    hp = unit.hp,
+                    speed = unit.speed,
+                    alive = unit.alive,
+                    tags = new List<string>(unit.tags ?? new List<string>())
+                }).ToList(),
+                buildings = (game.buildings ?? new List<BuildingState>()).Select(building => building == null ? null : new BuildingState
+                {
+                    id = building.id,
+                    factionId = building.factionId,
+                    position = building.position,
+                    type = building.type,
+                    level = building.level,
+                    hp = building.hp
+                }).ToList(),
+                factions = (game.factions ?? new List<FactionState>()).Select(faction => faction == null ? null : new FactionState
+                {
+                    id = faction.id,
+                    name = faction.name,
+                    kind = faction.kind,
+                    resources = CloneResources(faction.resources),
+                    maxSp = faction.maxSp,
+                    sp = faction.sp,
+                    relationToPlayer = faction.relationToPlayer
+                }).ToList(),
+                actionStats = (game.actionStats ?? new List<ActionStat>()).Select(stat => stat == null ? null : new ActionStat { type = stat.type, count = stat.count }).ToList(),
+                activeRules = new List<RuleNodeV1>(game.activeRules ?? new List<RuleNodeV1>()),
+                victoryContracts = new List<VictoryContractV1>(game.victoryContracts ?? new List<VictoryContractV1>()),
+                dynamicActions = new List<DynamicActionV1>(game.dynamicActions ?? new List<DynamicActionV1>()),
+                ruleState = (game.ruleState ?? new List<RuleStateEntry>()).Select(entry => entry == null ? null : new RuleStateEntry { key = entry.key, value = entry.value }).ToList(),
+                typedRuleState = (game.typedRuleState ?? new List<TypedRuleStateEntryV1>()).Select(entry => entry == null ? null : new TypedRuleStateEntryV1
+                {
+                    scope = entry.scope,
+                    scopeId = entry.scopeId,
+                    key = entry.key,
+                    valueType = entry.valueType,
+                    koreanName = entry.koreanName,
+                    iconToken = entry.iconToken,
+                    colorHex = entry.colorHex,
+                    numberValue = entry.numberValue,
+                    boolValue = entry.boolValue,
+                    setValue = new List<string>(entry.setValue ?? new List<string>()),
+                    stateTurn = entry.stateTurn
+                }).ToList(),
+                recentActionStats = (game.recentActionStats ?? new List<ActionTurnStatV1>()).Select(stat => stat == null ? null : new ActionTurnStatV1 { turn = stat.turn, type = stat.type, count = stat.count }).ToList(),
+                ruleBudget = new RuleRuntimeBudget
+                {
+                    turn = budget.turn,
+                    dispatches = budget.dispatches,
+                    conditionWork = budget.conditionWork,
+                    activations = budget.activations,
+                    effects = budget.effects,
+                    spawnedEntities = budget.spawnedEntities,
+                    loggedLimits = budget.loggedLimits
+                },
+                journal = new List<string>(game.journal ?? new List<string>()),
+                catalogHash = game.catalogHash
+            };
+        }
+
+        private static ResourceBag CloneResources(ResourceBag resources)
+        {
+            if (resources == null) return null;
+            return new ResourceBag
+            {
+                food = resources.food,
+                wood = resources.wood,
+                stone = resources.stone,
+                iron = resources.iron,
+                coin = resources.coin,
+                maxFood = resources.maxFood,
+                maxWood = resources.maxWood,
+                maxStone = resources.maxStone,
+                maxIron = resources.maxIron,
+                maxCoin = resources.maxCoin
+            };
+        }
+
         private static bool Matches(ConditionNode node, GameSnapshotV1 game, int depth, HashSet<ConditionNode> path, ref int visited)
         {
             if (node == null) return true;
             if (depth > RuleLimits.MaxConditionDepth || visited >= RuleLimits.MaxConditionNodes || !path.Add(node)) return false;
             visited++;
             bool primary;
-            if (node.op == CompareOp.Always) primary = true;
+            if (node.predicate != null)
+            {
+                primary = RuleExpressionRuntime.TryEvaluatePredicate(node.predicate, game, out var expressionMatch) && expressionMatch;
+            }
+            else if (node.op == CompareOp.Always) primary = true;
             else if (node.op == CompareOp.HasTag) primary = HasTag(node, game);
             else if (node.op == CompareOp.OwnerIs) primary = OwnerIs(node, game);
             else
@@ -740,16 +1440,31 @@ namespace OnlyMyGame.Core
                 case EffectType.Sp:
                     if (player != null && effect.amount != 0 && effect.amount >= -10 && effect.amount <= 10)
                     {
-                        player.sp = (int)Math.Min(Math.Max(0, player.maxSp), Math.Max(0L, (long)player.sp + effect.amount));
+                        // A world rule must not erase every action at turn start. If SP
+                        // was already spent below the three-point safety floor, a later
+                        // event may not refund it, but it also cannot reduce it further.
+                        var negativeFloor = Math.Min(Math.Max(0, player.sp), Math.Min(3, Math.Max(0, player.maxSp)));
+                        var minimum = effect.amount < 0 ? negativeFloor : 0;
+                        player.sp = (int)Math.Min(Math.Max(0, player.maxSp), Math.Max(minimum, (long)player.sp + effect.amount));
                         applied = true;
                     }
                     break;
                 case EffectType.Relation:
                     if (effect.amount != 0 && effect.amount >= -100 && effect.amount <= 100)
                     {
-                        foreach (var f in factions.Where(f => f != null && f.kind != FactionKind.Player))
+                        IEnumerable<FactionState> relationTargets = factions.Where(f => f != null && f.kind != FactionKind.Player);
+                        if (!string.IsNullOrEmpty(effect.target) && effect.target.StartsWith("faction:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (!int.TryParse(effect.target.Substring(8), out var targetFactionId)) break;
+                            relationTargets = relationTargets.Where(f => f.id == targetFactionId);
+                        }
+                        var changed = false;
+                        foreach (var f in relationTargets)
+                        {
                             f.relationToPlayer = (int)Math.Max(-100L, Math.Min(100L, (long)f.relationToPlayer + effect.amount));
-                        applied = true;
+                            changed = true;
+                        }
+                        applied = changed;
                     }
                     break;
                 case EffectType.Status:
@@ -825,13 +1540,17 @@ namespace OnlyMyGame.Core
                     {
                         var unit = (game.entities ?? new List<UnitState>()).FirstOrDefault(u => u != null && u.id == unitId);
                         var faction = factions.FirstOrDefault(f => f != null && f.id == newFaction);
-                        if (unit != null && faction != null && unit.factionId != 1)
+                        if (unit != null && faction != null && unit.factionId != 1 && unit.factionId != newFaction)
                         {
                             unit.factionId = newFaction;
                             SafeLog(log, "[규칙] " + source + ": 유닛 " + unitId + "이 세력 " + newFaction + "으로 전환되었습니다.");
                             applied = true;
                         }
                     }
+                    break;
+                case EffectType.TypedState:
+                    applied = RuleExpressionRuntime.ApplyStateMutation(effect.stateMutation, game);
+                    if (!applied) LogLimit(budget, StateLimitFlag, log, "타입 상태 효과가 타입·범위 검증을 통과하지 못해 무시했습니다.");
                     break;
             }
             if (applied) SafeLog(log, "[규칙] " + source + ": " + effect.type + " 효과 적용");
@@ -862,7 +1581,7 @@ namespace OnlyMyGame.Core
             var states = game.ruleState ?? (game.ruleState = new List<RuleStateEntry>());
             var entry = states.FirstOrDefault(x => x != null && string.Equals(x.key, key, StringComparison.Ordinal));
             if (entry != null) { entry.value = value; return true; }
-            if (states.Count >= RuleLimits.MaxStateVariables) return false;
+            if (states.Count + (game.typedRuleState?.Count ?? 0) >= RuleLimits.MaxStateVariables) return false;
             states.Add(new RuleStateEntry { key = key, value = value });
             return true;
         }
@@ -870,7 +1589,8 @@ namespace OnlyMyGame.Core
         private static bool HasTag(ConditionNode node, GameSnapshotV1 game)
         {
             if (string.IsNullOrEmpty(node.text)) return false;
-            IEnumerable<UnitState> units = (game.entities ?? new List<UnitState>()).Where(u => u != null && u.alive);
+            var visiblePositions = new HashSet<HexCoord>((game.map ?? new List<TileState>()).Where(tile => tile != null && tile.visible).Select(tile => tile.position));
+            IEnumerable<UnitState> units = (game.entities ?? new List<UnitState>()).Where(u => u != null && u.alive && (u.factionId == 1 || visiblePositions.Contains(u.position)));
             var selector = node.left ?? "any";
             if (string.Equals(selector, "player", StringComparison.OrdinalIgnoreCase)) units = units.Where(u => u.factionId == 1);
             else if (TryParseSelectorId(selector, "unit:", out var unitId)) units = units.Where(u => u.id == unitId);
@@ -883,13 +1603,14 @@ namespace OnlyMyGame.Core
         {
             var tiles = game.map ?? new List<TileState>();
             var selector = string.IsNullOrEmpty(node.left) ? node.text : node.left;
-            if (string.IsNullOrEmpty(selector) || string.Equals(selector, "any", StringComparison.OrdinalIgnoreCase)) return tiles.Any(t => t != null && t.owner == node.value);
+            if (string.IsNullOrEmpty(selector) || string.Equals(selector, "any", StringComparison.OrdinalIgnoreCase))
+                return tiles.Any(t => t != null && t.owner == node.value && (node.value == 1 || t.visible));
             if (string.Equals(selector, "player_tile", StringComparison.OrdinalIgnoreCase))
             {
                 var playerUnit = (game.entities ?? new List<UnitState>()).FirstOrDefault(u => u != null && u.factionId == 1 && u.alive);
                 return playerUnit != null && tiles.Any(t => t != null && t.position.Equals(playerUnit.position) && t.owner == node.value);
             }
-            return TryParseHex(selector, out var coord) && tiles.Any(t => t != null && t.position.Equals(coord) && t.owner == node.value);
+            return TryParseHex(selector, out var coord) && tiles.Any(t => t != null && t.position.Equals(coord) && t.owner == node.value && (node.value == 1 || t.visible));
         }
 
         private static RuleRuntimeBudget EnsureBudget(GameSnapshotV1 game)
@@ -899,6 +1620,7 @@ namespace OnlyMyGame.Core
             {
                 budget.turn = game.turn;
                 budget.dispatches = 0;
+                budget.conditionWork = 0;
                 budget.activations = 0;
                 budget.effects = 0;
                 budget.spawnedEntities = 0;
@@ -907,10 +1629,11 @@ namespace OnlyMyGame.Core
             else
             {
                 budget.dispatches = Math.Max(0, Math.Min(RuleLimits.MaxRuleDispatchesPerTurn, budget.dispatches));
+                budget.conditionWork = Math.Max(0, Math.Min(RuleLimits.MaxRuleConditionWorkPerTurn, budget.conditionWork));
                 budget.activations = Math.Max(0, Math.Min(RuleLimits.MaxRuleActivationsPerTurn, budget.activations));
                 budget.effects = Math.Max(0, Math.Min(RuleLimits.MaxRuleEffectsPerTurn, budget.effects));
                 budget.spawnedEntities = Math.Max(0, Math.Min(RuleLimits.MaxRuleSpawnsPerTurn, budget.spawnedEntities));
-                budget.loggedLimits &= DispatchLimitFlag | ActivationLimitFlag | EffectLimitFlag | SpawnLimitFlag | StateLimitFlag | CollectionLimitFlag;
+                budget.loggedLimits &= DispatchLimitFlag | ActivationLimitFlag | EffectLimitFlag | SpawnLimitFlag | StateLimitFlag | CollectionLimitFlag | ConditionWorkLimitFlag;
             }
             return budget;
         }
@@ -974,8 +1697,20 @@ namespace OnlyMyGame.Core
 
     public static class GameRules
     {
-        public static int BuildingCost(BuildingType type) => type == BuildingType.Headquarters ? 0 : type == BuildingType.Warehouse || type == BuildingType.Watchtower ? 3 : 5;
-        public static int CommandCost(CommandType type) => type == CommandType.Move ? 1 : type == CommandType.Build || type == CommandType.Upgrade ? 3 : 2;
+        public const int CaptureSpCost = 2;
+        public static int BuildingCost(BuildingType type)
+        {
+            if (type == BuildingType.Headquarters) return 8;
+            return type == BuildingType.Warehouse || type == BuildingType.Watchtower ? 3 : 5;
+        }
+        public static int BuildingIronCost(BuildingType type)
+        {
+            if (type == BuildingType.Headquarters) return 4;
+            if (type == BuildingType.Workshop) return 2;
+            if (type == BuildingType.Barracks) return 3;
+            return 0;
+        }
+        public static int CommandCost(CommandType type) => type == CommandType.Move ? 1 : type == CommandType.Build || type == CommandType.Upgrade ? 3 : type == CommandType.Capture ? CaptureSpCost : 2;
         public static bool IsRuleActive(RuleNodeV1 rule, int turn) => rule != null && turn >= rule.appliedTurn && (long)turn < (long)rule.appliedTurn + Math.Max(1, rule.durationTurns);
         public static void StartTurn(GameSnapshotV1 game)
         {
@@ -1003,6 +1738,31 @@ namespace OnlyMyGame.Core
             var stat = stats.FirstOrDefault(s => s != null && s.type == type);
             if (stat == null) stats.Add(new ActionStat { type = type, count = 1 });
             else if (stat.count < RuleLimits.MaxStateMagnitude) stat.count++;
+
+            PruneRecentActionStats(game);
+            var history = game.recentActionStats;
+            var recent = history.FirstOrDefault(entry => entry.turn == game.turn && entry.type == type);
+            if (recent == null)
+            {
+                if (history.Count >= RuleLimits.MaxRecentActionEntries)
+                {
+                    var oldest = history.OrderBy(entry => entry.turn).ThenBy(entry => (int)entry.type).First();
+                    history.Remove(oldest);
+                }
+                history.Add(new ActionTurnStatV1 { turn = game.turn, type = type, count = 1 });
+            }
+            else if (recent.count < RuleLimits.MaxStateMagnitude) recent.count++;
+            history.Sort((left, right) => left.turn != right.turn ? left.turn.CompareTo(right.turn) : ((int)left.type).CompareTo((int)right.type));
+        }
+
+        public static void PruneRecentActionStats(GameSnapshotV1 game)
+        {
+            if (game == null) return;
+            var history = game.recentActionStats ?? (game.recentActionStats = new List<ActionTurnStatV1>());
+            var minimumTurn = Math.Max(0, game.turn - RuleLimits.MaxRecentActionTurns + 1);
+            history.RemoveAll(entry => entry == null || entry.turn < minimumTurn || entry.turn > game.turn || !Enum.IsDefined(typeof(CommandType), entry.type) || entry.count <= 0 || entry.count > RuleLimits.MaxStateMagnitude);
+            history.Sort((left, right) => left.turn != right.turn ? left.turn.CompareTo(right.turn) : ((int)left.type).CompareTo((int)right.type));
+            while (history.Count > RuleLimits.MaxRecentActionEntries) history.RemoveAt(0);
         }
         // 감시탑이 시야를 확장한다. 기본 반경 2 + 감시탑 레벨 합계 1당 +1.
         public static int VisibilityRange(GameSnapshotV1 game, int factionId)
@@ -1020,8 +1780,16 @@ namespace OnlyMyGame.Core
             if (string.Equals(key, "kills", StringComparison.OrdinalIgnoreCase)) return game.playerKills;
             if (string.Equals(key, "buildings", StringComparison.OrdinalIgnoreCase)) return (game.buildings ?? new List<BuildingState>()).Count(x => x != null && x.factionId == 1);
             if (string.Equals(key, "coin", StringComparison.OrdinalIgnoreCase)) return (game.factions ?? new List<FactionState>()).FirstOrDefault(x => x != null && x.id == 1)?.resources?.coin ?? 0;
+            if (string.Equals(key, "territory", StringComparison.OrdinalIgnoreCase)) return (game.map ?? new List<TileState>()).Count(tile => tile != null && tile.owner == 1);
+            if (string.Equals(key, "alliances", StringComparison.OrdinalIgnoreCase)) return (game.factions ?? new List<FactionState>()).Count(faction => faction != null && faction.kind != FactionKind.Player && faction.relationToPlayer >= 60);
             long total = (game.actionStats ?? new List<ActionStat>()).Where(x => x != null && string.Equals(x.type.ToString(), key, StringComparison.OrdinalIgnoreCase)).Sum(x => (long)Math.Max(0, x.count));
             return (int)Math.Min(RuleLimits.MaxStateMagnitude, total);
+        }
+        public static int CollisionTieBreakScore(int factionId, int luck, int seededRoll)
+        {
+            var boundedRoll = Math.Max(0, Math.Min(99, seededRoll));
+            var luckBonus = factionId == 1 ? Math.Max(1, Math.Min(100, luck)) : 50;
+            return boundedRoll + luckBonus;
         }
         public static bool IsVictoryComplete(GameSnapshotV1 game, VictoryContractV1 contract) => game != null && contract != null && game.turn >= contract.achievableFromTurn && (long)game.turn >= (long)contract.announcedTurn + Math.Max(3, contract.minimumTurns) && Progress(game, contract.progressKey) >= contract.target;
         public static RunOutcome EvaluateOutcome(GameSnapshotV1 game)
@@ -1064,15 +1832,16 @@ namespace OnlyMyGame.Core
         public CommandType type;
         public HexCoord target;
         public int priority;
-        internal bool hasReservedBuildingType;
-        internal BuildingType reservedBuildingType;
+        // Warehouse is the safe legacy default when an older serialized command has
+        // no explicit buildingType field. New player commands always set this field.
+        public BuildingType buildingType = BuildingType.Warehouse;
         internal bool hasReservedActorPosition;
         internal HexCoord reservedActorPosition;
     }
 
     public static class TurnResolver
     {
-        // PRD 고정 해결 순서: 턴 시작 → 이동·충돌 → 거래·외교 → 전투 → 채집·건설 → 지속 효과 → 승패 판정
+        // PRD 고정 해결 순서: 턴 시작 → 이동·충돌 → 거래·외교 → 전투 → 점령·채집·건설 → 지속 효과 → 승패 판정
         public static void BeginPlanning(GameSnapshotV1 game, List<string> log)
         {
             if (game.planningPrepared || game.outcome != RunOutcome.Ongoing) return;
@@ -1103,10 +1872,13 @@ namespace OnlyMyGame.Core
             // 5. 전투 해결
             ResolveCombat(game, all, random, log, vm);
 
-            // 6. 채집·건설 해결
+            // 6. 전투 후 생존 상태를 기준으로 점령 해결
+            ResolveCapture(game, all, log, vm);
+
+            // 7. 채집·건설 해결
             ResolveGatherAndBuild(game, all, log, vm);
 
-            // 7. 지속 효과
+            // 8. 지속 효과
             vm.Execute(EventType.TurnEnd, game, log);
             game.outcome = GameRules.EvaluateOutcome(game);
             game.planningPrepared = false;
@@ -1119,7 +1891,6 @@ namespace OnlyMyGame.Core
             var candidates = (commands ?? new List<PlannedCommand>()).Where(command => command != null).ToList();
             foreach (var command in candidates)
             {
-                command.hasReservedBuildingType = false;
                 command.hasReservedActorPosition = false;
             }
             // Movement is the first resolution phase, so reserve one valid projection per
@@ -1149,12 +1920,10 @@ namespace OnlyMyGame.Core
             var entities = game.entities ?? new List<UnitState>();
             var buildings = game.buildings ?? new List<BuildingState>();
             var map = game.map ?? new List<TileState>();
-            var resourceType = ResourceType.None;
-            var resourceAmount = 0;
+            var resourceCosts = new List<KeyValuePair<ResourceType, int>>();
             TileState gatherTile = null;
             UnitState hiredUnit = null;
             BuildingState upgradedBuilding = null;
-            BuildingType? buildingType = null;
             var actorPosition = command.type == CommandType.Move ? unit.position : reservations.ProjectedUnitPosition(unit);
 
             switch (command.type)
@@ -1187,30 +1956,36 @@ namespace OnlyMyGame.Core
                     var targetUnit = entities.FirstOrDefault(target => target != null && target.factionId != command.factionId && target.alive && target.position.Equals(command.target));
                     var partner = targetUnit == null ? null : (game.factions ?? new List<FactionState>()).FirstOrDefault(candidate => candidate != null && candidate.id == targetUnit.factionId);
                     if (targetUnit == null || partner == null) return false;
-                    if (command.type == CommandType.Trade) { resourceType = ResourceType.Food; resourceAmount = 1; }
+                    if (command.type == CommandType.Trade) resourceCosts.Add(new KeyValuePair<ResourceType, int>(ResourceType.Food, 1));
                     if (command.type == CommandType.Hire)
                     {
                         if (partner.kind != FactionKind.Neutral || partner.relationToPlayer < 0 || !reservations.CanReserveHire(targetUnit.id)) return false;
                         hiredUnit = targetUnit;
-                        resourceType = ResourceType.Coin;
-                        resourceAmount = 3;
+                        resourceCosts.Add(new KeyValuePair<ResourceType, int>(ResourceType.Coin, 3));
                     }
                     break;
                 }
                 case CommandType.Build:
                 {
-                    if (buildings.Any(building => building != null && building.position.Equals(actorPosition)) || !reservations.CanReserveBuild(actorPosition)) return false;
-                    buildingType = NextBuildingType(reservations.ProjectedBuildingTypes(command.factionId));
-                    resourceType = ResourceType.Wood;
-                    resourceAmount = GameRules.BuildingCost(buildingType.Value);
+                    if (!Enum.IsDefined(typeof(BuildingType), command.buildingType) ||
+                        buildings.Any(building => building != null && building.position.Equals(actorPosition)) ||
+                        !reservations.CanReserveBuild(actorPosition, command.factionId, command.buildingType)) return false;
+                    resourceCosts.Add(new KeyValuePair<ResourceType, int>(ResourceType.Wood, GameRules.BuildingCost(command.buildingType)));
+                    var ironCost = GameRules.BuildingIronCost(command.buildingType);
+                    if (ironCost > 0) resourceCosts.Add(new KeyValuePair<ResourceType, int>(ResourceType.Iron, ironCost));
                     break;
                 }
                 case CommandType.Upgrade:
                 {
                     upgradedBuilding = buildings.FirstOrDefault(candidate => candidate != null && candidate.factionId == command.factionId && candidate.hp > 0 && candidate.position.Equals(command.target));
                     if (upgradedBuilding == null || actorPosition.Distance(upgradedBuilding.position) > 1 || !reservations.CanReserveUpgrade(upgradedBuilding.id)) return false;
-                    resourceType = ResourceType.Stone;
-                    resourceAmount = 3;
+                    resourceCosts.Add(new KeyValuePair<ResourceType, int>(ResourceType.Stone, 3));
+                    break;
+                }
+                case CommandType.Capture:
+                {
+                    var captureTile = map.FirstOrDefault(tile => tile != null && tile.position.Equals(actorPosition));
+                    if (command.factionId != 1 || faction.kind != FactionKind.Player || !command.target.Equals(actorPosition) || captureTile == null || captureTile.owner == 1 || !reservations.CanReserveCapture(actorPosition)) return false;
                     break;
                 }
                 case CommandType.Dynamic:
@@ -1225,14 +2000,15 @@ namespace OnlyMyGame.Core
                 rejection = faction.name + "의 예약 가능한 SP가 부족해 " + command.type + " 명령이 취소되었습니다.";
                 return false;
             }
-            if (resourceAmount > 0 && !reservations.CanReserveResource(faction, resourceType, resourceAmount))
+            var unavailableCost = resourceCosts.FirstOrDefault(cost => !reservations.CanReserveResource(faction, cost.Key, cost.Value));
+            if (unavailableCost.Value > 0)
             {
-                rejection = command.type + " 명령에 필요한 " + resourceType + " 자원이 이미 예약되었거나 부족합니다.";
+                rejection = command.type + " 명령에 필요한 " + unavailableCost.Key + " 자원이 이미 예약되었거나 부족합니다.";
                 return false;
             }
 
             reservations.ReserveSp(faction.id, spCost);
-            if (resourceAmount > 0) reservations.ReserveResource(faction.id, resourceType, resourceAmount);
+            foreach (var cost in resourceCosts) reservations.ReserveResource(faction.id, cost.Key, cost.Value);
             if (command.type == CommandType.Move) reservations.ReserveMove(unit.id, command.target);
             else
             {
@@ -1242,25 +2018,20 @@ namespace OnlyMyGame.Core
             if (gatherTile != null) reservations.ReserveGather(gatherTile.position);
             if (hiredUnit != null) reservations.ReserveHire(hiredUnit.id);
             if (upgradedBuilding != null) reservations.ReserveUpgrade(upgradedBuilding.id);
-            if (buildingType.HasValue)
-            {
-                reservations.ReserveBuild(actorPosition, command.factionId, buildingType.Value);
-                command.reservedBuildingType = buildingType.Value;
-                command.hasReservedBuildingType = true;
-            }
+            if (command.type == CommandType.Capture) reservations.ReserveCapture(actorPosition);
+            if (command.type == CommandType.Build) reservations.ReserveBuild(actorPosition, command.factionId, command.buildingType);
             return true;
         }
-
-        private static BuildingType NextBuildingType(ICollection<BuildingType> built) => !built.Contains(BuildingType.Warehouse) ? BuildingType.Warehouse : !built.Contains(BuildingType.Workshop) ? BuildingType.Workshop : !built.Contains(BuildingType.Watchtower) ? BuildingType.Watchtower : !built.Contains(BuildingType.Market) ? BuildingType.Market : BuildingType.Barracks;
 
         private sealed class CommandReservationLedger
         {
             private readonly GameSnapshotV1 game;
             private readonly Dictionary<int, int> sp = new Dictionary<int, int>();
             private readonly Dictionary<int, Dictionary<ResourceType, int>> resources = new Dictionary<int, Dictionary<ResourceType, int>>();
-            private readonly Dictionary<int, HashSet<BuildingType>> buildingTypes = new Dictionary<int, HashSet<BuildingType>>();
             private readonly Dictionary<HexCoord, int> gathered = new Dictionary<HexCoord, int>();
             private readonly HashSet<HexCoord> buildPositions = new HashSet<HexCoord>();
+            private readonly HashSet<int> headquartersReservations = new HashSet<int>();
+            private readonly HashSet<HexCoord> capturePositions = new HashSet<HexCoord>();
             private readonly HashSet<int> upgradedBuildings = new HashSet<int>();
             private readonly HashSet<int> hiredUnits = new HashSet<int>();
             private readonly Dictionary<int, HexCoord> projectedUnitPositions = new Dictionary<int, HexCoord>();
@@ -1289,21 +2060,20 @@ namespace OnlyMyGame.Core
             public void ReserveHire(int unitId) { hiredUnits.Add(unitId); }
             public bool CanReserveUpgrade(int buildingId) => !upgradedBuildings.Contains(buildingId);
             public void ReserveUpgrade(int buildingId) { upgradedBuildings.Add(buildingId); }
-            public bool CanReserveBuild(HexCoord position) => !buildPositions.Contains(position) && (long)(game.buildings?.Count ?? 0) + buildingReservations < RuleLimits.MaxBuildings;
+            public bool CanReserveCapture(HexCoord position) => !capturePositions.Contains(position);
+            public void ReserveCapture(HexCoord position) { capturePositions.Add(position); }
+            public bool CanReserveBuild(HexCoord position, int factionId, BuildingType type)
+            {
+                if (buildPositions.Contains(position) || (long)(game.buildings?.Count ?? 0) + buildingReservations >= RuleLimits.MaxBuildings) return false;
+                if (type != BuildingType.Headquarters) return true;
+                return !headquartersReservations.Contains(factionId) && !(game.buildings ?? new List<BuildingState>())
+                    .Any(building => building != null && building.factionId == factionId && building.type == BuildingType.Headquarters && building.hp > 0);
+            }
             public void ReserveBuild(HexCoord position, int factionId, BuildingType type)
             {
                 buildPositions.Add(position);
                 buildingReservations++;
-                ProjectedBuildingTypes(factionId).Add(type);
-            }
-            public HashSet<BuildingType> ProjectedBuildingTypes(int factionId)
-            {
-                if (!buildingTypes.TryGetValue(factionId, out var types))
-                {
-                    types = new HashSet<BuildingType>((game.buildings ?? new List<BuildingState>()).Where(building => building != null && building.factionId == factionId).Select(building => building.type));
-                    buildingTypes[factionId] = types;
-                }
-                return types;
+                if (type == BuildingType.Headquarters) headquartersReservations.Add(factionId);
             }
             public void CommitSp(GameSnapshotV1 snapshot)
             {
@@ -1367,31 +2137,81 @@ namespace OnlyMyGame.Core
             {
                 var candidates = group.ToList();
                 if (candidates.Count == 0) continue;
-                // 속도 우선, 동률이면 시드 기반 난수로 결정
+                // 속도 우선, 동률이면 HUD 행운 보정과 시드 기반 난수로 결정
                 var winner = candidates
-                    .OrderByDescending(c => Speed(game, c.unitId))
-                    .ThenByDescending(c => random.Next(0, 100))
-                    .First();
+                    .Select(command => new { command, seededRoll = random.Next(0, 100) })
+                    .OrderByDescending(candidate => Speed(game, candidate.command.unitId))
+                    .ThenByDescending(candidate => GameRules.CollisionTieBreakScore(candidate.command.factionId, game.luck, candidate.seededRoll))
+                    .ThenBy(candidate => candidate.command.factionId)
+                    .ThenBy(candidate => candidate.command.unitId)
+                    .First().command;
                 provisional.Add(winner);
                 foreach (var c in candidates)
                 {
                     if (c != winner) log.Add("유닛 " + c.unitId + "은 이동 충돌로 제자리에 머뭅니다.");
                 }
             }
+            // A move into an occupied tile is only safe when every occupant will
+            // actually vacate it. Propagate a blocked tail backwards through the
+            // dependency graph so A->B, B->C cannot stack A on B when C is fixed.
             var movingIds = new HashSet<int>(provisional.Select(c => c.unitId));
+            var occupantsByPosition = (game.entities ?? new List<UnitState>())
+                .Where(unit => unit != null && unit.alive)
+                .GroupBy(unit => unit.position)
+                .ToDictionary(group => group.Key, group => group.ToList());
+            var dependentsByOccupant = new Dictionary<int, List<int>>();
+            var blockedIds = new HashSet<int>();
+            var blockedQueue = new Queue<int>();
             foreach (var move in provisional)
             {
-                var unit = game.entities.FirstOrDefault(u => u.id == move.unitId && u.alive);
-                if (unit == null) continue;
-                var occupant = game.entities.FirstOrDefault(u => u.alive && u.id != unit.id && u.position.Equals(move.target) && !movingIds.Contains(u.id));
-                if (occupant != null)
+                if (!occupantsByPosition.TryGetValue(move.target, out var occupants)) continue;
+                foreach (var occupant in occupants.Where(unit => unit.id != move.unitId))
                 {
-                    log.Add("유닛 " + unit.id + "은 점유된 타일 앞에서 멈췄습니다.");
-                    continue;
+                    if (!movingIds.Contains(occupant.id))
+                    {
+                        if (blockedIds.Add(move.unitId)) blockedQueue.Enqueue(move.unitId);
+                        continue;
+                    }
+                    if (!dependentsByOccupant.TryGetValue(occupant.id, out var dependents))
+                    {
+                        dependents = new List<int>();
+                        dependentsByOccupant[occupant.id] = dependents;
+                    }
+                    dependents.Add(move.unitId);
                 }
-                unit.position = move.target;
-                if (unit.factionId == 1) GameRules.CountAction(game, CommandType.Move);
-                log.Add("유닛 " + unit.id + "이 이동했습니다.");
+            }
+            while (blockedQueue.Count > 0)
+            {
+                var blockedOccupant = blockedQueue.Dequeue();
+                if (!dependentsByOccupant.TryGetValue(blockedOccupant, out var dependents)) continue;
+                foreach (var dependent in dependents)
+                {
+                    if (blockedIds.Add(dependent)) blockedQueue.Enqueue(dependent);
+                }
+            }
+            foreach (var move in provisional.Where(candidate => blockedIds.Contains(candidate.unitId)))
+                log.Add("유닛 " + move.unitId + "은 점유된 타일 앞에서 멈췄습니다.");
+
+            var resolvedMoves = provisional
+                .Where(candidate => !blockedIds.Contains(candidate.unitId))
+                .Select(move => new
+                {
+                    command = move,
+                    unit = game.entities.FirstOrDefault(candidate => candidate.id == move.unitId && candidate.alive)
+                })
+                .Where(resolved => resolved.unit != null)
+                .ToList();
+            // Commit the entire successful movement phase before any rule observes it.
+            // Player progress is part of that same state transition.
+            foreach (var resolved in resolvedMoves)
+            {
+                resolved.unit.position = resolved.command.target;
+                if (resolved.unit.factionId == 1) GameRules.CountAction(game, CommandType.Move);
+            }
+            // Preserve the existing deterministic event order after the atomic commit.
+            foreach (var resolved in resolvedMoves)
+            {
+                log.Add("유닛 " + resolved.unit.id + "이 이동했습니다.");
                 vm.Execute(EventType.Move, game, log);
                 vm.Execute(EventType.TileEntered, game, log);
             }
@@ -1510,6 +2330,34 @@ namespace OnlyMyGame.Core
             }
         }
 
+        private static void ResolveCapture(GameSnapshotV1 game, List<PlannedCommand> commands, List<string> log, RuleVm vm)
+        {
+            foreach (var command in commands.Where(candidate => candidate.type == CommandType.Capture))
+            {
+                var unit = (game.entities ?? new List<UnitState>()).FirstOrDefault(candidate => candidate != null && candidate.id == command.unitId && candidate.factionId == 1 && candidate.alive);
+                if (unit == null || !IsAtReservedActorPosition(unit, command, log)) continue;
+                var tile = (game.map ?? new List<TileState>()).FirstOrDefault(candidate => candidate != null && candidate.position.Equals(unit.position));
+                if (tile == null || tile.owner == 1 || !command.target.Equals(unit.position))
+                {
+                    log?.Add("점령할 수 없는 타일입니다.");
+                    continue;
+                }
+
+                var enemyUnitRemains = (game.entities ?? new List<UnitState>()).Any(candidate => candidate != null && candidate.factionId != 1 && candidate.alive && candidate.position.Equals(unit.position));
+                var enemyStrongholdRemains = (game.buildings ?? new List<BuildingState>()).Any(candidate => candidate != null && candidate.factionId != 1 && candidate.hp > 0 && candidate.position.Equals(unit.position));
+                if (enemyUnitRemains || enemyStrongholdRemains)
+                {
+                    log?.Add("살아있는 적 유닛 또는 적 거점이 남아 점령에 실패했습니다.");
+                    continue;
+                }
+
+                tile.owner = 1;
+                GameRules.CountAction(game, CommandType.Capture);
+                log?.Add("유닛 " + unit.id + "이 " + tile.position + " 타일을 원정대 영토로 점령했습니다.");
+                vm.Execute(EventType.Capture, game, log);
+            }
+        }
+
         private static void ResolveGatherAndBuild(GameSnapshotV1 game, List<PlannedCommand> commands, List<string> log, RuleVm vm)
         {
             foreach (var c in commands.Where(x => x.type == CommandType.Gather || x.type == CommandType.Hunt || x.type == CommandType.Build || x.type == CommandType.Upgrade))
@@ -1544,10 +2392,13 @@ namespace OnlyMyGame.Core
                 else if (c.type == CommandType.Build)
                 {
                     if (game.buildings.Any(b => b.position.Equals(unit.position))) { log.Add("이미 건물이 있는 타일입니다."); continue; }
-                    var built = game.buildings.Where(b => b.factionId == c.factionId).Select(b => b.type).ToList();
-                    var type = c.hasReservedBuildingType ? c.reservedBuildingType : NextBuildingType(built);
-                    if (faction.resources.Spend(ResourceType.Wood, GameRules.BuildingCost(type)))
+                    var type = Enum.IsDefined(typeof(BuildingType), c.buildingType) ? c.buildingType : BuildingType.Warehouse;
+                    var woodCost = GameRules.BuildingCost(type);
+                    var ironCost = GameRules.BuildingIronCost(type);
+                    if (faction.resources.Get(ResourceType.Wood) >= woodCost && faction.resources.Get(ResourceType.Iron) >= ironCost)
                     {
+                        faction.resources.Spend(ResourceType.Wood, woodCost);
+                        if (ironCost > 0) faction.resources.Spend(ResourceType.Iron, ironCost);
                         var id = game.buildings.Count == 0 ? 1 : game.buildings.Max(b => b.id) + 1;
                         game.buildings.Add(new BuildingState { id = id, factionId = c.factionId, position = unit.position, type = type });
                         var tile = game.map.FirstOrDefault(t => t.position.Equals(unit.position));
@@ -1556,7 +2407,7 @@ namespace OnlyMyGame.Core
                         log.Add(type + "을 건설했습니다.");
                         vm.Execute(EventType.Build, game, log);
                     }
-                    else log.Add(type + " 건설에 필요한 목재가 부족합니다.");
+                    else log.Add(type + " 건설에 필요한 목재 또는 철이 부족합니다.");
                 }
                 else if (c.type == CommandType.Upgrade)
                 {
@@ -1575,3 +2426,7 @@ namespace OnlyMyGame.Core
         }
     }
 }
+
+#pragma warning restore UAC1008
+#pragma warning restore UAC1006
+#pragma warning restore UAC1005

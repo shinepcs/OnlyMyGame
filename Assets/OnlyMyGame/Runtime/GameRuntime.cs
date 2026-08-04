@@ -52,6 +52,11 @@ namespace OnlyMyGame.Runtime
 
     public sealed class GameController : MonoBehaviour
     {
+        private static readonly int BaseColorProperty = Shader.PropertyToID("_BaseColor");
+        private static readonly int ColorProperty = Shader.PropertyToID("_Color");
+        private static MaterialPropertyBlock tintProperties;
+        private static Material runtimeLitMaterial;
+        private static Material runtimeUnlitMaterial;
         private GameSnapshotV1 game;
         private readonly List<string> ledger = new List<string>();
         private readonly List<PlannedCommand> commands = new List<PlannedCommand>();
@@ -67,7 +72,12 @@ namespace OnlyMyGame.Runtime
         private QuarterViewCameraController cameraController;
         private GameFeedback feedback;
         private readonly List<GameObject> targetHighlights = new List<GameObject>();
+        private readonly List<GameObject> ruleCueVisuals = new List<GameObject>();
+        private GameObject luckFeedbackVisual;
+        private LuckWorldFeedback luckFeedback;
         private CommandType? targetingCommand;
+        private DynamicActionV1 targetingDynamicAction;
+        private int targetingDynamicActorId = -1;
         private string targetingPrompt = "";
         private string serviceStatus = "AI 연결 확인 중";
         private bool serviceOnline;
@@ -75,7 +85,7 @@ namespace OnlyMyGame.Runtime
         private bool compatibilityChecked;
         private bool serviceCompatible;
         private string expectedApiVersion = "v1";
-        private string expectedCompatibilityVersion = "rules-v2-strict-2026-08";
+        private string expectedCompatibilityVersion = "rules-v4-targeting-2026-08";
         private string sessionToken = "";
         private float sessionValidUntilRealtime;
         private bool sessionReady;
@@ -125,7 +135,12 @@ namespace OnlyMyGame.Runtime
         private const string BackupKey = "onlymygame.autosave.v1.backup";
         private const string TempKey = "onlymygame.autosave.v1.pending";
         private const string PreviousRunKey = "onlymygame.previous-run.v1";
-        private const int CommercialDynamicActionLimit = 3;
+        private const int CommercialDynamicActionLimit = RuleLimits.MaxDynamicActionsPerRuleSet;
+        private static readonly BuildingType[] PlayerBuildTypes =
+        {
+            BuildingType.Headquarters, BuildingType.Warehouse, BuildingType.Workshop,
+            BuildingType.Watchtower, BuildingType.Market, BuildingType.Barracks
+        };
 
         private void Awake()
         {
@@ -208,6 +223,9 @@ namespace OnlyMyGame.Runtime
             foreach (var item in tileVisuals.Values) Destroy(item);
             foreach (var item in unitVisuals.Values) Destroy(item);
             foreach (var item in buildingVisuals.Values) Destroy(item);
+            if (luckFeedbackVisual != null) Destroy(luckFeedbackVisual);
+            luckFeedbackVisual = null;
+            luckFeedback = null;
             tileVisuals.Clear();
             unitVisuals.Clear();
             buildingVisuals.Clear();
@@ -237,8 +255,55 @@ namespace OnlyMyGame.Runtime
 
             foreach (var building in game.buildings) SpawnBuildingVisual(building);
             foreach (var unit in game.entities.Where(x => x.alive)) SpawnUnitVisual(unit);
+            CreateLuckFeedback();
 
             RenderVisibility();
+        }
+
+        private void CreateLuckFeedback()
+        {
+            luckFeedbackVisual = new GameObject("LuckFeedback");
+            luckFeedbackVisual.tag = "RuleCue";
+
+            var markerPrefab = presentation?.flagPlayer ?? presentation?.propTarget;
+            var marker = Spawn(markerPrefab, PrimitiveType.Cylinder);
+            marker.name = "LuckSign";
+            marker.transform.SetParent(luckFeedbackVisual.transform, false);
+            marker.transform.localPosition = Vector3.zero;
+            marker.transform.localScale = markerPrefab == null ? new Vector3(.24f, .3f, .24f) : marker.transform.localScale * .38f;
+            foreach (var collider in marker.GetComponentsInChildren<Collider>(true)) collider.enabled = false;
+
+            var label = new GameObject("LuckLabel");
+            label.transform.SetParent(luckFeedbackVisual.transform, false);
+            label.transform.localPosition = Vector3.up * 1.08f;
+            var text = label.AddComponent<TextMesh>();
+            text.characterSize = .14f;
+            text.fontSize = 46;
+            text.anchor = TextAnchor.MiddleCenter;
+            text.alignment = TextAlignment.Center;
+            text.fontStyle = FontStyle.Bold;
+            var font = Resources.Load<Font>("Fonts/NanumGothic-Regular") ?? Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+            if (font != null) text.font = font;
+            var mainCamera = Camera.main;
+            if (mainCamera != null) label.transform.rotation = mainCamera.transform.rotation;
+
+            luckFeedback = luckFeedbackVisual.AddComponent<LuckWorldFeedback>();
+            luckFeedback.Configure(marker.transform, label.transform, text, mainCamera != null ? mainCamera.transform : null);
+            UpdateLuckFeedback(false);
+        }
+
+        private void UpdateLuckFeedback(bool celebrate)
+        {
+            if (luckFeedbackVisual == null || luckFeedback == null || game == null) return;
+            var headquarters = game.buildings.FirstOrDefault(building => building != null && building.factionId == 1 && building.type == BuildingType.Headquarters && building.hp > 0);
+            var playerUnit = game.entities.FirstOrDefault(unit => unit != null && unit.factionId == 1 && unit.alive);
+            var anchor = headquarters != null ? headquarters.position : playerUnit != null ? playerUnit.position : new HexCoord(0, 0);
+            luckFeedbackVisual.transform.position = HexToWorld(anchor) + Vector3.up * .1f;
+
+            var anchorTile = game.map.FirstOrDefault(tile => tile != null && tile.position.Equals(anchor));
+            luckFeedbackVisual.SetActive(anchorTile != null && anchorTile.visible && (headquarters != null || playerUnit != null));
+            luckFeedback.BindCharacter(playerUnit != null && unitVisuals.TryGetValue(playerUnit.id, out var character) ? character.transform : null);
+            luckFeedback.SetLuck(game.luck, celebrate);
         }
 
         private UnityEngine.Object SelectTilePrefab(string terrain)
@@ -426,7 +491,36 @@ namespace OnlyMyGame.Runtime
 
         private static void Tint(GameObject visual, Color tint)
         {
-            foreach (var renderer in visual.GetComponentsInChildren<Renderer>()) renderer.material.color = tint;
+            foreach (var renderer in visual.GetComponentsInChildren<Renderer>()) SetRendererColor(renderer, tint);
+        }
+
+        private static void SetRendererColor(Renderer renderer, Color tint)
+        {
+            if (renderer == null) return;
+            tintProperties ??= new MaterialPropertyBlock();
+            tintProperties.Clear();
+            renderer.GetPropertyBlock(tintProperties);
+            tintProperties.SetColor(BaseColorProperty, tint);
+            tintProperties.SetColor(ColorProperty, tint);
+            renderer.SetPropertyBlock(tintProperties);
+        }
+
+        private static Material RuntimeMaterial(bool unlit)
+        {
+            var cached = unlit ? runtimeUnlitMaterial : runtimeLitMaterial;
+            if (cached != null) return cached;
+            var shader = unlit
+                ? Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Universal Render Pipeline/Lit")
+                : Shader.Find("Universal Render Pipeline/Lit");
+            if (shader == null) return null;
+            cached = new Material(shader)
+            {
+                name = unlit ? "OnlyMyGame Runtime Unlit" : "OnlyMyGame Runtime Lit",
+                hideFlags = HideFlags.HideAndDontSave
+            };
+            if (unlit) runtimeUnlitMaterial = cached;
+            else runtimeLitMaterial = cached;
+            return cached;
         }
 
         private static GameObject Spawn(UnityEngine.Object prefab, PrimitiveType fallback)
@@ -442,13 +536,11 @@ namespace OnlyMyGame.Runtime
         private static GameObject CreatePrimitiveWithUrp(PrimitiveType type)
         {
             var go = GameObject.CreatePrimitive(type);
-            var shader = Shader.Find("Universal Render Pipeline/Lit");
-            if (shader != null)
+            var material = RuntimeMaterial(false);
+            if (material != null)
             {
                 foreach (var renderer in go.GetComponentsInChildren<Renderer>())
-                {
-                    renderer.material = new Material(shader);
-                }
+                    renderer.sharedMaterial = material;
             }
             return go;
         }
@@ -461,12 +553,12 @@ namespace OnlyMyGame.Runtime
             go.transform.localScale = new Vector3(radius, 0.025f, radius);
             var collider = go.GetComponent<Collider>();
             if (collider != null) Destroy(collider);
-            var shader = Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Universal Render Pipeline/Lit");
-            if (shader != null)
+            var renderer = go.GetComponent<Renderer>();
+            var material = RuntimeMaterial(true);
+            if (renderer != null && material != null)
             {
-                var material = new Material(shader);
-                material.color = color;
-                go.GetComponent<Renderer>().material = material;
+                renderer.sharedMaterial = material;
+                SetRendererColor(renderer, color);
             }
             return go;
         }
@@ -485,7 +577,7 @@ namespace OnlyMyGame.Runtime
                 // Keep the full board silhouette readable while concealing undiscovered details.
                 go.SetActive(true);
                 var tint = tile.visible ? Color.white : tile.explored ? new Color(.24f, .3f, .4f, 1f) : new Color(.075f, .095f, .14f, 1f);
-                foreach (var renderer in go.GetComponentsInChildren<Renderer>(true)) renderer.material.color = tint;
+                foreach (var renderer in go.GetComponentsInChildren<Renderer>(true)) SetRendererColor(renderer, tint);
                 var resource = go.transform.Find("Resource_" + tile.position);
                 if (resource != null) resource.gameObject.SetActive(tile.visible && tile.amount > 0);
             }
@@ -505,35 +597,79 @@ namespace OnlyMyGame.Runtime
                     go.SetActive(unit.alive && tile != null && tile.visible);
                 }
             }
+            UpdateLuckFeedback(false);
             RenderRuleCues();
         }
 
         private void RenderRuleCues()
         {
-            foreach (var old in GameObject.FindGameObjectsWithTag("RuleCue")) Destroy(old);
-            var active = game.activeRules.Where(r => GameRules.IsRuleActive(r, game.turn)).ToList();
+            foreach (var old in ruleCueVisuals.Where(old => old != null)) Destroy(old);
+            ruleCueVisuals.Clear();
+            var active = game.activeRules
+                .Where(rule => rule != null && GameRules.IsRuleActive(rule, game.turn))
+                .OrderByDescending(rule => rule.appliedTurn)
+                .ThenByDescending(rule => rule.priority)
+                .ThenBy(rule => rule.id ?? string.Empty, StringComparer.Ordinal)
+                .Take(6)
+                .ToList();
             if (active.Count == 0) return;
-            var playerUnit = game.entities.FirstOrDefault(u => u.factionId == 1 && u.alive);
-            if (playerUnit == null) return;
-            for (var i = 0; i < Math.Min(active.Count, 3); i++)
+            var palette = new[]
+            {
+                new Color(1f, .78f, .22f), new Color(.3f, .86f, 1f), new Color(.78f, .46f, 1f),
+                new Color(.4f, 1f, .55f), new Color(1f, .42f, .45f), new Color(1f, .68f, .36f)
+            };
+            for (var i = 0; i < active.Count; i++)
             {
                 var rule = active[i];
-                var cue = new GameObject("RuleCue_" + i);
-                cue.tag = "RuleCue";
-                var text = cue.AddComponent<TextMesh>();
-                text.characterSize = .18f;
-                text.fontSize = 40;
-                text.anchor = TextAnchor.MiddleCenter;
-                text.color = new Color(1f, .9f, .3f);
-                var font = Resources.Load<Font>("Fonts/NanumGothic-Regular");
-                if (font == null) font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
-                if (font != null) text.font = font;
-                var displayName = string.IsNullOrWhiteSpace(rule.name) ? "이름 없는 규칙" : rule.name.Trim();
-                text.text = "◆ " + displayName.Replace('<', '＜').Replace('>', '＞');
-                var offset = new HexCoord(playerUnit.position.q + (i + 1), playerUnit.position.r - (i + 1));
-                cue.transform.position = HexToWorld(offset) + Vector3.up * .5f;
-                if (Camera.main != null) cue.transform.rotation = Camera.main.transform.rotation;
+                var targets = RuleCuePlanner.ResolveVisibleTargets(game, rule, 3);
+                for (var targetIndex = 0; targetIndex < targets.Count; targetIndex++)
+                    SpawnRuleCue(rule, targets[targetIndex], palette[i % palette.Length], i, targetIndex);
             }
+        }
+
+        private void SpawnRuleCue(RuleNodeV1 rule, HexCoord target, Color color, int ruleIndex, int targetIndex)
+        {
+            var root = new GameObject("RuleCue_" + ruleIndex + "_" + targetIndex);
+            root.tag = "RuleCue";
+            root.transform.position = HexToWorld(target) + Vector3.up * .08f;
+            ruleCueVisuals.Add(root);
+
+            var markerPrefab = presentation?.propTarget ?? presentation?.flagNeutral;
+            var marker = Spawn(markerPrefab, PrimitiveType.Cylinder);
+            marker.name = "RuleCueMarker";
+            marker.transform.SetParent(root.transform, false);
+            marker.transform.localPosition = Vector3.zero;
+            marker.transform.localScale = markerPrefab == null ? new Vector3(.3f, .035f, .3f) : marker.transform.localScale * .32f;
+            foreach (var collider in marker.GetComponentsInChildren<Collider>(true)) collider.enabled = false;
+            Tint(marker, color);
+
+            var label = new GameObject("RuleCueLabel");
+            label.transform.SetParent(root.transform, false);
+            label.transform.localPosition = Vector3.up * .88f;
+            var text = label.AddComponent<TextMesh>();
+            text.characterSize = .125f;
+            text.fontSize = 42;
+            text.anchor = TextAnchor.MiddleCenter;
+            text.alignment = TextAlignment.Center;
+            text.fontStyle = FontStyle.Bold;
+            text.color = color;
+            var font = Resources.Load<Font>("Fonts/NanumGothic-Regular") ?? Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+            if (font != null) text.font = font;
+            var displayName = SafeWorldCueText(rule.name, "새 세계 규칙", 18);
+            var worldCue = SafeWorldCueText(rule.worldCue, "영향 대상", 18);
+            text.text = "◆ " + displayName + "\n" + worldCue;
+            var mainCamera = Camera.main;
+            if (mainCamera != null) label.transform.rotation = mainCamera.transform.rotation;
+
+            var pulse = root.AddComponent<RuleCuePulse>();
+            pulse.Configure(marker.transform, label.transform, ruleIndex * 1.17f + targetIndex * .63f, mainCamera != null ? mainCamera.transform : null);
+        }
+
+        private static string SafeWorldCueText(string value, string fallback, int maximumLength)
+        {
+            var safe = string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
+            safe = safe.Replace('<', '＜').Replace('>', '＞').Replace('\n', ' ').Replace('\r', ' ');
+            return safe.Length <= maximumLength ? safe : safe.Substring(0, maximumLength - 1) + "…";
         }
 
         // ==================== 선택 & 버블 UI ====================
@@ -598,11 +734,11 @@ namespace OnlyMyGame.Runtime
             if (unit.factionId == 1)
             {
                 if (usedSp + GameRules.CommandCost(CommandType.Move) <= player.sp)
-                    items.Add(MakeBubble("이동", new Color(.3f, .8f, 1f), "인접 타일로 이동 (SP 1)", () => BeginCommand(CommandType.Move)));
+                    items.Add(MakeBubble("이동", new Color(.3f, .8f, 1f), "인접 이동 · 동속 충돌은 행운+시드 난수 (SP 1)", () => BeginCommand(CommandType.Move)));
                 if (usedSp + GameRules.CommandCost(CommandType.Gather) <= player.sp)
                     items.Add(MakeBubble("채집", new Color(.4f, .9f, .4f), "자원 채집 (SP 2)", () => BeginCommand(CommandType.Gather)));
                 if (usedSp + GameRules.CommandCost(CommandType.Hunt) <= player.sp)
-                    items.Add(MakeBubble("수렵", new Color(.9f, .6f, .3f), "식량 사냥 (SP 2)", () => BeginCommand(CommandType.Hunt)));
+                    items.Add(MakeBubble("수렵", new Color(.9f, .6f, .3f), "초원 식량 2 / 숲 3, 행운 70+ 보너스 1 (SP 2)", () => BeginCommand(CommandType.Hunt)));
                 if (usedSp + GameRules.CommandCost(CommandType.Attack) <= player.sp)
                     items.Add(MakeBubble("공격", new Color(1f, .35f, .35f), "근접 공격 (SP 2)", () => BeginCommand(CommandType.Attack)));
                 if (usedSp + GameRules.CommandCost(CommandType.Trade) <= player.sp)
@@ -610,11 +746,13 @@ namespace OnlyMyGame.Runtime
                 if (usedSp + GameRules.CommandCost(CommandType.Hire) <= player.sp)
                     items.Add(MakeBubble("고용", new Color(.7f, .5f, .9f), "화폐 3 → 용병 (SP 2)", () => BeginCommand(CommandType.Hire)));
                 if (usedSp + GameRules.CommandCost(CommandType.Build) <= player.sp)
-                    items.Add(MakeBubble("건설", new Color(.6f, .8f, .5f), "건물 건설 (SP 3)", () => BeginCommand(CommandType.Build)));
+                    items.Add(MakeBubble("건설", new Color(.6f, .8f, .5f), "건물 종류와 비용을 선택해 건설 (SP 3)", () => BeginCommand(CommandType.Build)));
                 if (usedSp + GameRules.CommandCost(CommandType.Upgrade) <= player.sp)
                     items.Add(MakeBubble("강화", new Color(.8f, .7f, .4f), "건물 강화 (SP 3)", () => BeginCommand(CommandType.Upgrade)));
                 if (usedSp + GameRules.CommandCost(CommandType.Persuade) <= player.sp)
                     items.Add(MakeBubble("설득", new Color(.9f, .5f, .8f), "관계 개선 (SP 2)", () => BeginCommand(CommandType.Persuade)));
+                if (usedSp + GameRules.CommandCost(CommandType.Capture) <= player.sp && CanBeginCommand(CommandType.Capture))
+                    items.Add(MakeBubble("점령", new Color(.35f, .78f, 1f), "이동 후 적 유닛·거점이 없으면 영토로 확보 (SP 2)", () => BeginCommand(CommandType.Capture)));
             }
             else
             {
@@ -659,7 +797,7 @@ namespace OnlyMyGame.Runtime
         public int PlannedSp => commands.Sum(c => GameRules.CommandCost(c.type));
         public bool IsBusy => waitingForRules || game?.phase == RunPhase.Resolving || game?.phase == RunPhase.AwaitingRules;
         public bool IsBlocked => blockedOnRules;
-        public bool IsTargeting => targetingCommand.HasValue;
+        public bool IsTargeting => targetingCommand.HasValue || targetingDynamicAction != null;
         public string TargetingPrompt => targetingPrompt;
         public string BlockReason => blockReason;
         public string ServiceStatus => serviceStatus;
@@ -670,6 +808,7 @@ namespace OnlyMyGame.Runtime
         public bool HasSavedRun => SafeReadSave(TempKey) != null || SafeReadSave(SaveKey) != null || SafeReadSave(BackupKey) != null;
         public bool HasPreviousRun => SafeReadSave(PreviousRunKey) != null;
         public IReadOnlyList<DynamicActionV1> DynamicActions => game?.dynamicActions ?? (IReadOnlyList<DynamicActionV1>)Array.Empty<DynamicActionV1>();
+        public IReadOnlyList<BuildingType> BuildTypes => PlayerBuildTypes;
 
         public bool CanBeginCommand(CommandType command)
         {
@@ -688,7 +827,6 @@ namespace OnlyMyGame.Runtime
             var replacing = commands.LastOrDefault(c => c.unitId == actor.id && c.type == command);
             var usedWithoutActor = PlannedSp - (replacing == null ? 0 : GameRules.CommandCost(command));
             if (usedWithoutActor + GameRules.CommandCost(command) > player.sp) return false;
-            if (!HasPlanningResources(command, replacing)) return false;
             var actorPosition = ProjectedActorPosition(actor);
             if (command == CommandType.Gather)
             {
@@ -697,10 +835,34 @@ namespace OnlyMyGame.Runtime
                 if (tile == null || tile.resource == ResourceType.None || tile.amount <= alreadyReserved) return false;
             }
             if (command == CommandType.Hunt && !game.map.Any(tile => tile != null && tile.position.Equals(actorPosition))) return false;
-            if (command == CommandType.Build && (game.buildings.Any(b => b.position.Equals(actorPosition)) ||
-                commands.Any(planned => planned != null && planned != replacing && planned.type == CommandType.Build && planned.target.Equals(actorPosition)))) return false;
+            if (command == CommandType.Capture)
+            {
+                var tile = game.map.FirstOrDefault(candidate => candidate != null && candidate.position.Equals(actorPosition));
+                if (tile == null || tile.owner == 1 || commands.Any(planned => planned != null && planned != replacing && planned.type == CommandType.Capture && planned.target.Equals(actorPosition))) return false;
+            }
+            if (command == CommandType.Build)
+                return !game.buildings.Any(b => b.position.Equals(actorPosition)) &&
+                       !commands.Any(planned => planned != null && planned != replacing && planned.type == CommandType.Build && planned.target.Equals(actorPosition));
+            if (!HasPlanningResources(command, replacing)) return false;
             if (command == CommandType.Upgrade && commands.Any(planned => planned != null && planned != replacing && planned.type == CommandType.Upgrade && planned.target.Equals(SelectedBuilding.position))) return false;
             return true;
+        }
+
+        public bool CanBuildType(BuildingType type)
+        {
+            if (!Enum.IsDefined(typeof(BuildingType), type) || game == null || game.outcome != RunOutcome.Ongoing ||
+                game.phase != RunPhase.Planning || IsBusy || blockedOnRules) return false;
+            var player = game.factions.FirstOrDefault(faction => faction != null && faction.id == 1);
+            var actor = SelectedUnit;
+            if (player == null || actor == null || actor.factionId != 1) return false;
+            var replacing = commands.LastOrDefault(command => command != null && command.unitId == actor.id && command.type == CommandType.Build);
+            var usedWithoutBuild = PlannedSp - (replacing == null ? 0 : GameRules.CommandCost(CommandType.Build));
+            if (usedWithoutBuild + GameRules.CommandCost(CommandType.Build) > player.sp) return false;
+            var actorPosition = ProjectedActorPosition(actor);
+            if (game.buildings.Any(building => building != null && building.position.Equals(actorPosition)) ||
+                commands.Any(planned => planned != null && planned != replacing && planned.type == CommandType.Build && planned.target.Equals(actorPosition))) return false;
+            if (type == BuildingType.Headquarters && game.buildings.Any(building => building != null && building.factionId == 1 && building.type == BuildingType.Headquarters && building.hp > 0)) return false;
+            return HasPlanningResources(CommandType.Build, replacing, type);
         }
 
         public void BeginCommand(CommandType command)
@@ -712,6 +874,11 @@ namespace OnlyMyGame.Runtime
             }
             CancelTargeting(false);
             var actor = command == CommandType.Upgrade ? ClosestPlayerUnit(SelectedBuilding.position) : SelectedUnit;
+            if (command == CommandType.Build)
+            {
+                commercialHud?.ShowBuildPicker();
+                return;
+            }
             if (command == CommandType.Move || command == CommandType.Attack || command == CommandType.Trade || command == CommandType.Persuade || command == CommandType.Hire)
             {
                 targetingCommand = command;
@@ -724,7 +891,18 @@ namespace OnlyMyGame.Runtime
             Queue(command, actor.id, target);
         }
 
-        private void Queue(CommandType command, int unitId, HexCoord target)
+        public bool QueueBuildFromHud(BuildingType type)
+        {
+            if (!CanBuildType(type))
+            {
+                commercialHud?.Toast("선택한 건물을 지금 건설할 수 없습니다.", new Color(1f, .55f, .3f));
+                return false;
+            }
+            var actor = SelectedUnit;
+            return actor != null && Queue(CommandType.Build, actor.id, ProjectedActorPosition(actor), type);
+        }
+
+        private bool Queue(CommandType command, int unitId, HexCoord target, BuildingType buildingType = BuildingType.Warehouse)
         {
             var player = game.factions.First(f => f.id == 1);
             var previous = commands.LastOrDefault(c => c.unitId == unitId && c.type == command);
@@ -734,15 +912,15 @@ namespace OnlyMyGame.Runtime
             {
                 if (previousIndex >= 0) commands.Insert(previousIndex, previous);
                 commercialHud?.Toast("남은 SP가 부족합니다.", new Color(1f, .45f, .35f));
-                return;
+                return false;
             }
-            if (!HasPlanningResources(command, null))
+            if (!HasPlanningResources(command, null, buildingType))
             {
                 if (previousIndex >= 0) commands.Insert(previousIndex, previous);
                 commercialHud?.Toast("다른 명령에 예약된 자원을 제외하면 비용이 부족합니다.", new Color(1f, .55f, .3f));
-                return;
+                return false;
             }
-            var planned = new PlannedCommand { factionId = 1, unitId = unitId, type = command, target = target };
+            var planned = new PlannedCommand { factionId = 1, unitId = unitId, type = command, target = target, buildingType = buildingType };
             commands.Add(planned);
             var invalidatedCount = 0;
             if (command == CommandType.Move)
@@ -753,13 +931,14 @@ namespace OnlyMyGame.Runtime
                     selfAction.target = target;
                 invalidatedCount = RemoveInvalidProjectedCommands(unitId, planned);
             }
-            ledger.Add("[계획] " + CommandKorean(command) + " 예약 · " + ExpectedRange(command));
+            ledger.Add("[계획] " + (command == CommandType.Build ? BuildingName(buildingType) + " 건설" : CommandKorean(command)) + " 예약 · " + ExpectedRange(command));
             if (unitVisuals.TryGetValue(unitId, out var visual)) feedback?.CommandQueued(visual.transform.position);
             commercialHud?.Toast(invalidatedCount > 0
                 ? CommandKorean(command) + " 예약 · 새 위치에서 불가능한 후속 명령 " + invalidatedCount + "개를 취소했습니다."
                 : CommandKorean(command) + " 명령을 예약했습니다.", new Color(.5f, 1f, .7f));
             CancelTargeting(false);
             RefreshHud();
+            return true;
         }
 
         public void UndoLastCommand()
@@ -795,6 +974,8 @@ namespace OnlyMyGame.Runtime
         private void CancelTargeting(bool notify)
         {
             targetingCommand = null;
+            targetingDynamicAction = null;
+            targetingDynamicActorId = -1;
             targetingPrompt = "";
             foreach (var highlight in targetHighlights) if (highlight != null) Destroy(highlight);
             targetHighlights.Clear();
@@ -827,8 +1008,9 @@ namespace OnlyMyGame.Runtime
             }
         }
 
-        private bool TryTarget(HexCoord position)
+        private bool TryTarget(HexCoord position, DynamicTargetKind clickedKind = DynamicTargetKind.Tile, int clickedTargetId = 0)
         {
+            if (targetingDynamicAction != null) return TryTargetDynamicAction(position, clickedKind, clickedTargetId);
             if (!targetingCommand.HasValue) return false;
             var command = targetingCommand.Value;
             var actor = SelectedUnit;
@@ -878,7 +1060,7 @@ namespace OnlyMyGame.Runtime
 
         private static bool IsSelfTileAction(CommandType command)
         {
-            return command == CommandType.Gather || command == CommandType.Hunt || command == CommandType.Build;
+            return command == CommandType.Gather || command == CommandType.Hunt || command == CommandType.Build || command == CommandType.Capture;
         }
 
         private int RemoveInvalidProjectedCommands(int unitId, PlannedCommand moveToKeep)
@@ -908,8 +1090,16 @@ namespace OnlyMyGame.Runtime
                 return tile != null && tile.resource != ResourceType.None && tile.amount > earlierReservations;
             }
             if (planned.type == CommandType.Hunt) return game.map.Any(tile => tile != null && tile.position.Equals(actorPosition));
-            if (planned.type == CommandType.Build) return !game.buildings.Any(building => building != null && building.position.Equals(actorPosition)) &&
-                !earlier.Any(candidate => candidate != null && candidate.type == CommandType.Build && candidate.target.Equals(actorPosition));
+            if (planned.type == CommandType.Capture)
+            {
+                var tile = game.map.FirstOrDefault(candidate => candidate != null && candidate.position.Equals(actorPosition));
+                return tile != null && tile.owner != 1 && !earlier.Any(candidate => candidate != null && candidate.type == CommandType.Capture && candidate.target.Equals(actorPosition));
+            }
+            if (planned.type == CommandType.Build)
+                return Enum.IsDefined(typeof(BuildingType), planned.buildingType) &&
+                       !game.buildings.Any(building => building != null && building.position.Equals(actorPosition)) &&
+                       !earlier.Any(candidate => candidate != null && candidate.type == CommandType.Build && candidate.target.Equals(actorPosition)) &&
+                       (planned.buildingType != BuildingType.Headquarters || !game.buildings.Any(building => building != null && building.factionId == 1 && building.type == BuildingType.Headquarters && building.hp > 0));
             if (planned.type == CommandType.Upgrade)
                 return !earlier.Any(candidate => candidate != null && candidate.type == CommandType.Upgrade && candidate.target.Equals(planned.target)) &&
                     game.buildings.Any(building => building != null && building.factionId == 1 && building.hp > 0 && building.position.Equals(planned.target) && actorPosition.Distance(building.position) <= 1);
@@ -918,7 +1108,7 @@ namespace OnlyMyGame.Runtime
             return false;
         }
 
-        private bool HasPlanningResources(CommandType requested, PlannedCommand excluded)
+        private bool HasPlanningResources(CommandType requested, PlannedCommand excluded, BuildingType buildingType = BuildingType.Warehouse)
         {
             var player = game?.factions.FirstOrDefault(faction => faction != null && faction.id == 1);
             if (player?.resources == null) return false;
@@ -929,8 +1119,8 @@ namespace OnlyMyGame.Runtime
             else if (requested == CommandType.Upgrade) AddReservation(reserved, ResourceType.Stone, 3);
             else if (requested == CommandType.Build)
             {
-                var projectedTypes = ProjectedBuildingTypes(excluded);
-                AddReservation(reserved, ResourceType.Wood, GameRules.BuildingCost(NextPlannedBuildingType(projectedTypes)));
+                AddReservation(reserved, ResourceType.Wood, GameRules.BuildingCost(buildingType));
+                AddReservation(reserved, ResourceType.Iron, GameRules.BuildingIronCost(buildingType));
             }
             return reserved.All(pair => pair.Value <= player.resources.Get(pair.Key));
         }
@@ -938,9 +1128,6 @@ namespace OnlyMyGame.Runtime
         private Dictionary<ResourceType, int> PlanningResourceReservations(PlannedCommand excluded)
         {
             var reserved = new Dictionary<ResourceType, int>();
-            var projectedTypes = new HashSet<BuildingType>((game?.buildings ?? new List<BuildingState>())
-                .Where(building => building != null && building.factionId == 1)
-                .Select(building => building.type));
             foreach (var planned in commands)
             {
                 if (planned == null || planned == excluded) continue;
@@ -949,25 +1136,12 @@ namespace OnlyMyGame.Runtime
                 else if (planned.type == CommandType.Upgrade) AddReservation(reserved, ResourceType.Stone, 3);
                 else if (planned.type == CommandType.Build)
                 {
-                    var type = NextPlannedBuildingType(projectedTypes);
+                    var type = Enum.IsDefined(typeof(BuildingType), planned.buildingType) ? planned.buildingType : BuildingType.Warehouse;
                     AddReservation(reserved, ResourceType.Wood, GameRules.BuildingCost(type));
-                    projectedTypes.Add(type);
+                    AddReservation(reserved, ResourceType.Iron, GameRules.BuildingIronCost(type));
                 }
             }
             return reserved;
-        }
-
-        private HashSet<BuildingType> ProjectedBuildingTypes(PlannedCommand excluded)
-        {
-            var projected = new HashSet<BuildingType>((game?.buildings ?? new List<BuildingState>())
-                .Where(building => building != null && building.factionId == 1)
-                .Select(building => building.type));
-            foreach (var planned in commands)
-            {
-                if (planned == null || planned == excluded || planned.type != CommandType.Build) continue;
-                projected.Add(NextPlannedBuildingType(projected));
-            }
-            return projected;
         }
 
         private static void AddReservation(IDictionary<ResourceType, int> reserved, ResourceType type, int amount)
@@ -975,33 +1149,32 @@ namespace OnlyMyGame.Runtime
             reserved[type] = (reserved.TryGetValue(type, out var current) ? current : 0) + amount;
         }
 
-        private static BuildingType NextPlannedBuildingType(ICollection<BuildingType> built)
-        {
-            if (!built.Contains(BuildingType.Warehouse)) return BuildingType.Warehouse;
-            if (!built.Contains(BuildingType.Workshop)) return BuildingType.Workshop;
-            if (!built.Contains(BuildingType.Watchtower)) return BuildingType.Watchtower;
-            if (!built.Contains(BuildingType.Market)) return BuildingType.Market;
-            return BuildingType.Barracks;
-        }
-
         private UnitState ClosestPlayerUnit(HexCoord position) => game.entities.Where(u => u.factionId == 1 && u.alive).OrderBy(u => ProjectedActorPosition(u).Distance(position)).FirstOrDefault();
 
-        private string ExpectedRange(CommandType c)
+        public static string ExpectedRange(CommandType c)
         {
-            if (c == CommandType.Move) return "인접한 통행 가능 타일로 이동";
+            if (c == CommandType.Move) return "인접 타일로 이동 · 동속 충돌은 행운 보정+시드 난수";
             if (c == CommandType.Gather) return "현재 타일 자원 2 획득";
             if (c == CommandType.Attack) return "피해 2~3, 행운 70 이상이면 3";
-            if (c == CommandType.Hunt) return "식량 2, 행운 60 이상이면 4";
+            if (c == CommandType.Hunt) return "초원 식량 2 / 숲 3, 행운 70 이상이면 +1";
             if (c == CommandType.Trade) return "식량 1 → 화폐 2, 관계 +4";
             if (c == CommandType.Hire) return "화폐 3 → 고용병 1";
-            if (c == CommandType.Build) return "목재 3~5 → 건물 1채";
+            if (c == CommandType.Build) return "선택 건물 비용 지불 → 건물 1채";
             if (c == CommandType.Upgrade) return "석재 3 → 건물 레벨 +1";
+            if (c == CommandType.Capture) return "이동 후 현재 타일 · 해결 시 살아있는 적 유닛·거점이 없으면 점령";
             return "";
         }
 
-        private string CommandKorean(CommandType c) => c == CommandType.Move ? "이동" : c == CommandType.Gather ? "채집" : c == CommandType.Hunt ? "수렵" : c == CommandType.Attack ? "공격" : c == CommandType.Trade ? "거래" : c == CommandType.Hire ? "고용" : c == CommandType.Build ? "건설" : c == CommandType.Upgrade ? "강화" : "설득";
+        public static string CommandKorean(CommandType c) => c == CommandType.Move ? "이동" : c == CommandType.Gather ? "채집" : c == CommandType.Hunt ? "수렵" : c == CommandType.Attack ? "공격" : c == CommandType.Trade ? "거래" : c == CommandType.Hire ? "고용" : c == CommandType.Build ? "건설" : c == CommandType.Upgrade ? "강화" : c == CommandType.Capture ? "점령" : "설득";
 
-        public string Describe(PlannedCommand command) => "유닛 " + command.unitId + " · " + CommandKorean(command.type) + " → " + command.target + "  (SP " + GameRules.CommandCost(command.type) + ")";
+        public string Describe(PlannedCommand command)
+        {
+            var action = command.type == CommandType.Build ? BuildingName(command.buildingType) + " 건설" : CommandKorean(command.type);
+            var resources = command.type == CommandType.Build
+                ? " · 목재 " + GameRules.BuildingCost(command.buildingType) + (GameRules.BuildingIronCost(command.buildingType) > 0 ? " · 철 " + GameRules.BuildingIronCost(command.buildingType) : string.Empty)
+                : string.Empty;
+            return "유닛 " + command.unitId + " · " + action + " → " + command.target + "  (SP " + GameRules.CommandCost(command.type) + resources + ")";
+        }
 
         public void EndTurnFromHud() => EndTurn();
         public void RetryRulesFromHud() => RetryRules();
@@ -1132,19 +1305,39 @@ namespace OnlyMyGame.Runtime
 
         public bool CanRunDynamic(DynamicActionV1 action)
         {
-            if (action == null || game == null || game.phase != RunPhase.Planning || game.outcome != RunOutcome.Ongoing || IsBusy || blockedOnRules) return false;
-            if (!game.dynamicActions.Contains(action) || game.turn < action.availableTurn || action.spCost < 0 || action.resourceAmount < 0) return false;
-            var player = game.factions.FirstOrDefault(f => f.id == 1);
-            if (player == null || player.sp - PlannedSp < action.spCost) return false;
-            if (action.resourceAmount > 0)
+            if (!CanPayForDynamicAction(action) || !RuleValidator.ValidateDynamicActionCurrentWorldForRuntime(action, game).valid) return false;
+            if (!DynamicActionTargeting.RequiresTarget(action)) return RuleVm.ConditionMatches(action.condition, game);
+            var actor = SelectedUnit;
+            return actor != null && actor.factionId == 1 &&
+                   TryGetExecutableDynamicTargets(action, actor.id, out var candidates) && candidates.Count > 0;
+        }
+
+        public List<bool> CanRunDynamicsForHud(IReadOnlyList<DynamicActionV1> actions)
+        {
+            var count = Math.Min(actions?.Count ?? 0, CommercialDynamicActionLimit);
+            var results = Enumerable.Repeat(false, count).ToList();
+            if (count == 0 || game == null) return results;
+
+            var targeted = new List<int>();
+            for (var index = 0; index < count; index++)
             {
-                if (action.resourceCost == ResourceType.None) return false;
-                var reserved = PlanningResourceReservations(null);
-                var plannedAmount = reserved.TryGetValue(action.resourceCost, out var amount) ? amount : 0;
-                if ((long)plannedAmount + action.resourceAmount > player.resources.Get(action.resourceCost)) return false;
+                var action = actions[index];
+                // HUD refresh is allowed to be optimistic about current-world
+                // effect references. Conditions are evaluated below, while the
+                // complete reference validation remains on click and immediately
+                // before mutation so polling cannot multiply full-world scans.
+                if (!CanPayForDynamicAction(action)) continue;
+                if (DynamicActionTargeting.RequiresTarget(action)) targeted.Add(index);
+                else results[index] = RuleVm.ConditionMatches(action.condition, game);
             }
-            if (!RuleValidator.ValidateDynamicActionForRuntime(action, game).valid) return false;
-            return RuleVm.ConditionMatches(action.condition, game);
+
+            var actor = SelectedUnit;
+            if (targeted.Count == 0 || actor == null || actor.factionId != 1) return results;
+            var targetedActions = targeted.Select(index => actions[index]).ToList();
+            if (!DynamicActionTargeting.TryResolveExecutableCandidatesBatch(targetedActions, game, actor.id, out var candidatePages)) return results;
+            for (var pageIndex = 0; pageIndex < targeted.Count; pageIndex++)
+                results[targeted[pageIndex]] = candidatePages[pageIndex].Count > 0;
+            return results;
         }
 
         public void RunDynamicFromHud(DynamicActionV1 action)
@@ -1154,6 +1347,122 @@ namespace OnlyMyGame.Runtime
                 commercialHud?.Toast("이 AI 행동은 지금 실행할 수 없습니다.", new Color(1f, .55f, .3f));
                 return;
             }
+            if (DynamicActionTargeting.RequiresTarget(action))
+            {
+                BeginDynamicActionTargeting(action);
+                return;
+            }
+            ExecuteDynamicAction(action, null);
+        }
+
+        private bool CanPayForDynamicAction(DynamicActionV1 action)
+        {
+            if (action == null || game == null || game.phase != RunPhase.Planning || game.outcome != RunOutcome.Ongoing || IsBusy || blockedOnRules) return false;
+            // Actions enter this list only after RuleValidator validation (or a
+            // validated save load). Keep HUD polling O(1) here; targeted actions
+            // still run the bounded selected-actor resolver in CanRunDynamic and
+            // are resolved again immediately before execution.
+            if (!(game.dynamicActions ?? new List<DynamicActionV1>()).Contains(action) ||
+                game.turn < action.availableTurn || action.spCost < 0 || action.spCost > 10 ||
+                action.cooldown < 0 || action.cooldown > RuleLimits.MaxScheduleDelay ||
+                action.resourceAmount < 0 || action.resourceAmount > RuleLimits.MaxEffectMagnitude ||
+                !Enum.IsDefined(typeof(ResourceType), action.resourceCost) ||
+                action.resourceAmount > 0 && action.resourceCost == ResourceType.None ||
+                !DynamicActionTargeting.IsSelectorShapeSafe(action.targetSelector)) return false;
+            var player = (game.factions ?? new List<FactionState>()).FirstOrDefault(f => f != null && f.id == 1);
+            if (player?.resources == null || player.sp - PlannedSp < action.spCost) return false;
+            if (action.resourceAmount > 0)
+            {
+                if (action.resourceCost == ResourceType.None) return false;
+                var reserved = PlanningResourceReservations(null);
+                var plannedAmount = reserved.TryGetValue(action.resourceCost, out var amount) ? amount : 0;
+                if ((long)plannedAmount + action.resourceAmount > player.resources.Get(action.resourceCost)) return false;
+            }
+            return RuleValidator.ValidateDynamicActionStructureForRuntime(action, game).valid;
+        }
+
+        private bool TryGetExecutableDynamicTargets(DynamicActionV1 action, int actorUnitId, out List<DynamicActionTargetV1> executable)
+        {
+            return DynamicActionTargeting.TryResolveExecutableCandidates(action, game, actorUnitId, out executable);
+        }
+
+        private void BeginDynamicActionTargeting(DynamicActionV1 action)
+        {
+            var actor = SelectedUnit;
+            if (actor == null || actor.factionId != 1 || !TryGetExecutableDynamicTargets(action, actor.id, out var candidates) || candidates.Count == 0)
+            {
+                commercialHud?.Toast("선택한 아군이 실행할 수 있는 공개 대상이 없습니다.", new Color(1f, .55f, .3f));
+                return;
+            }
+            // The target list is validated once when targeting begins. It is not
+            // trusted after this point: click handling and execution both resolve it
+            // again against current visibility and IDs.
+            CancelTargeting(false);
+            targetingDynamicAction = action;
+            targetingDynamicActorId = actor.id;
+            targetingPrompt = action.name + " · " + DynamicActionTargeting.DescribeSelector(action.targetSelector) + "을 선택하세요.  ·  우클릭/Esc 취소";
+            foreach (var position in candidates.Select(candidate => candidate.tile).Distinct())
+                targetHighlights.Add(CreateDisc("DynamicTarget_" + position, HexToWorld(position) + Vector3.up * .17f, .7f, new Color(.75f, .42f, 1f, .8f)));
+            RefreshHud();
+        }
+
+        private bool TryTargetDynamicAction(HexCoord position, DynamicTargetKind clickedKind, int clickedTargetId)
+        {
+            var action = targetingDynamicAction;
+            var actorId = targetingDynamicActorId;
+            if (action == null) return false;
+            if (!TryGetExecutableDynamicTargets(action, actorId, out var candidates))
+            {
+                CancelTargeting(false);
+                commercialHud?.Toast("대상 검증 예산을 초과해 행동을 취소했습니다.", new Color(1f, .55f, .3f));
+                return true;
+            }
+            var selected = DynamicActionTargeting.FindClickedCandidate(candidates, clickedKind, clickedTargetId, position);
+            if (selected == null)
+            {
+                commercialHud?.Toast("강조된 종류의 유효 대상을 선택하세요.", new Color(1f, .55f, .3f));
+                return true;
+            }
+            ExecuteDynamicAction(action, selected);
+            return true;
+        }
+
+        private void ExecuteDynamicAction(DynamicActionV1 action, DynamicActionTargetV1 selectedTarget)
+        {
+            if (!CanPayForDynamicAction(action) || !RuleValidator.ValidateDynamicActionCurrentWorldForRuntime(action, game).valid)
+            {
+                CancelTargeting(false);
+                commercialHud?.Toast("행동 비용·참조 또는 재사용 조건이 더 이상 유효하지 않습니다.", new Color(1f, .55f, .3f));
+                return;
+            }
+
+            ConditionNode executionCondition;
+            List<EffectNode> executionEffects;
+            if (DynamicActionTargeting.RequiresTarget(action))
+            {
+                // Second validation after the click: exact target kind, ID, tile,
+                // visibility, distance, binding and condition must still match.
+                if (selectedTarget == null || !TryGetExecutableDynamicTargets(action, selectedTarget.actorUnitId, out var currentTargets))
+                {
+                    commercialHud?.Toast("대상 정보를 다시 확인할 수 없어 실행하지 않았습니다.", new Color(1f, .55f, .3f));
+                    return;
+                }
+                var currentTarget = currentTargets.FirstOrDefault(candidate => DynamicActionTargeting.SameTarget(candidate, selectedTarget));
+                if (currentTarget == null || !DynamicActionTargeting.TryBindExecution(action, currentTarget, out executionCondition, out executionEffects) ||
+                    !RuleVm.TryConditionMatchesWithinBudget(executionCondition, game, RuleLimits.MaxDynamicTargetConditionWork, out var matches, out _) || !matches)
+                {
+                    commercialHud?.Toast("대상이 시야·거리·조건 검증을 더 이상 통과하지 않습니다.", new Color(1f, .55f, .3f));
+                    return;
+                }
+                selectedTarget = currentTarget;
+            }
+            else
+            {
+                executionCondition = action.condition;
+                executionEffects = action.effects;
+                if (!RuleVm.ConditionMatches(executionCondition, game)) return;
+            }
+
             GameSnapshotV1 beforeAction;
             try
             {
@@ -1172,21 +1481,35 @@ namespace OnlyMyGame.Runtime
             var player = game.factions.First(f => f.id == 1);
             if (action.resourceAmount > 0 && !player.resources.Spend(action.resourceCost, action.resourceAmount)) return;
             player.sp -= action.spCost;
-            var applied = new RuleVm().ApplyValidatedEffects(action.effects, game, ledger, action.name);
-            if (applied != action.effects.Count)
+            var applied = new RuleVm().ApplyValidatedEffects(executionEffects, game, ledger, action.name);
+            if (applied != executionEffects.Count)
             {
                 game = beforeAction;
                 if (ledger.Count > ledgerCount) ledger.RemoveRange(ledgerCount, ledger.Count - ledgerCount);
+                CancelTargeting(false);
                 commercialHud?.Toast("모든 효과를 적용할 수 없어 행동과 비용을 되돌렸습니다.", new Color(1f, .55f, .3f));
                 RefreshHud();
                 return;
             }
-            action.availableTurn = game.turn + Math.Max(1, action.cooldown);
+            var liveAction = (game.dynamicActions ?? new List<DynamicActionV1>()).FirstOrDefault(candidate =>
+                candidate != null && (ReferenceEquals(candidate, action) || !string.IsNullOrEmpty(action.id) && string.Equals(candidate.id, action.id, StringComparison.Ordinal)));
+            if (liveAction == null)
+            {
+                game = beforeAction;
+                if (ledger.Count > ledgerCount) ledger.RemoveRange(ledgerCount, ledger.Count - ledgerCount);
+                CancelTargeting(false);
+                commercialHud?.Toast("행동 상태가 변경되어 비용과 효과를 되돌렸습니다.", new Color(1f, .55f, .3f));
+                RefreshHud();
+                return;
+            }
+            liveAction.availableTurn = (int)Math.Min(int.MaxValue, (long)game.turn + Math.Max(1, liveAction.cooldown));
             TrimDynamicActions();
             GameRules.CountAction(game, CommandType.Dynamic);
-            ledger.Add("AI 행동 실행: " + action.name + " — " + action.description);
-            var unit = game.entities.FirstOrDefault(u => u.factionId == 1 && u.alive);
-            if (unit != null) feedback?.Reward(HexToWorld(unit.position), action.name);
+            ledger.Add("AI 행동 실행: " + action.name + (selectedTarget == null ? string.Empty : " · 대상 " + selectedTarget.kind + "@" + selectedTarget.tile) + " — " + action.description);
+            var feedbackPosition = selectedTarget?.tile ?? game.entities.FirstOrDefault(u => u.factionId == 1 && u.alive)?.position;
+            if (feedbackPosition.HasValue) feedback?.Reward(HexToWorld(feedbackPosition.Value), action.name);
+            CancelTargeting(false);
+            WorldGenerator.Reveal(game);
             StartCoroutine(AnimateResolvedTurn());
             RenderVisibility();
             Save();
@@ -1255,7 +1578,18 @@ namespace OnlyMyGame.Runtime
             }
 
             game.turn++;
+            if (!PrepareTypedStateForCurrentTurn(game))
+            {
+                ledger.Add("새 턴의 논리 상태를 안전하게 준비하지 못했습니다.");
+                BlockOnRules("저장된 세계 규칙의 논리 상태가 충돌합니다. 원정을 다시 불러오거나 지원이 필요합니다.");
+                yield break;
+            }
+            GameRules.PruneRecentActionStats(game);
             game.luck = new DeterministicRandom(game.seed + game.turn * 7919).Next(1, 101);
+            UpdateLuckFeedback(true);
+            var luckMessage = game.luck >= 70 ? "호운 — 전투와 수렵 보너스가 열립니다." : game.luck >= 35 ? "평운 — 기본 확률이 적용됩니다." : "흉운 — 이동 충돌의 변수를 주의하세요.";
+            ledger.Add("턴 " + game.turn + " 행운 " + game.luck + " · " + luckMessage);
+            commercialHud?.Toast("☀ 행운 " + game.luck + " · " + luckMessage, game.luck >= 70 ? new Color(.3f, .9f, 1f) : game.luck >= 35 ? new Color(1f, .78f, .28f) : new Color(1f, .38f, .34f));
             game.phase = RunPhase.AwaitingRules;
             game.planningPrepared = false;
             Save();
@@ -1380,6 +1714,7 @@ namespace OnlyMyGame.Runtime
                 request.SetRequestHeader("Authorization", "Bearer " + sessionToken);
                 request.SetRequestHeader("Idempotency-Key", game.runId + "-" + game.turn);
                 request.SetRequestHeader("X-Unity-Version", Application.unityVersion);
+                request.SetRequestHeader("X-Rules-Compatibility", expectedCompatibilityVersion);
                 request.timeout = 20;
                 yield return request.SendWebRequest();
                 if (request.responseCode != 401 || attempt > 0) break;
@@ -1506,6 +1841,7 @@ namespace OnlyMyGame.Runtime
             request.downloadHandler = new DownloadHandlerBuffer();
             request.SetRequestHeader("Content-Type", "application/json");
             request.SetRequestHeader("X-Unity-Version", Application.unityVersion);
+            request.SetRequestHeader("X-Rules-Compatibility", expectedCompatibilityVersion);
             request.timeout = 8;
             yield return request.SendWebRequest();
             if (request.result != UnityWebRequest.Result.Success)
@@ -1743,6 +2079,8 @@ namespace OnlyMyGame.Runtime
             if (snapshot.victoryContracts == null) snapshot.victoryContracts = new List<VictoryContractV1>();
             if (snapshot.dynamicActions == null) snapshot.dynamicActions = new List<DynamicActionV1>();
             if (snapshot.ruleState == null) snapshot.ruleState = new List<RuleStateEntry>();
+            if (snapshot.typedRuleState == null) snapshot.typedRuleState = new List<TypedRuleStateEntryV1>();
+            if (snapshot.recentActionStats == null) snapshot.recentActionStats = new List<ActionTurnStatV1>();
             if (snapshot.journal == null) snapshot.journal = new List<string>();
             snapshot.turn = Math.Max(1, snapshot.turn);
             snapshot.luck = Math.Max(1, Math.Min(100, snapshot.luck));
@@ -1759,8 +2097,16 @@ namespace OnlyMyGame.Runtime
                 snapshot.phase = RunPhase.AwaitingRules;
                 snapshot.planningPrepared = false;
             }
+            GameRules.PruneRecentActionStats(snapshot);
             if (snapshot.outcome != RunOutcome.Ongoing) snapshot.phase = RunPhase.Terminal;
+            if (!PrepareTypedStateForCurrentTurn(snapshot)) return false;
             return true;
+        }
+
+        private static bool PrepareTypedStateForCurrentTurn(GameSnapshotV1 snapshot)
+        {
+            if (snapshot == null || !RuleExpressionRuntime.CanonicalizeStoredStateScopeIds(snapshot)) return false;
+            return snapshot.outcome != RunOutcome.Ongoing || RuleExpressionRuntime.EnsureActiveDefinitions(snapshot);
         }
 
         private void Save()
@@ -1816,6 +2162,11 @@ namespace OnlyMyGame.Runtime
         {
             if (Camera.main == null) return;
             var ray = Camera.main.ScreenPointToRay(Input.mousePosition);
+            if (targetingDynamicAction != null)
+            {
+                TryTargetDynamicActionFromRay(ray);
+                return;
+            }
             if (Physics.Raycast(ray, out var hit, 200f))
             {
                 // 버블 클릭이 우선
@@ -1829,7 +2180,7 @@ namespace OnlyMyGame.Runtime
                 if (clicker != null)
                 {
                     var unit = game.entities.FirstOrDefault(u => u.id == clicker.UnitId);
-                    if (unit != null && TryTarget(unit.position)) return;
+                    if (unit != null && TryTarget(unit.position, DynamicTargetKind.Unit, unit.id)) return;
                     SelectUnit(clicker.UnitId);
                     return;
                 }
@@ -1837,19 +2188,81 @@ namespace OnlyMyGame.Runtime
                 if (bClicker != null)
                 {
                     var building = game.buildings.FirstOrDefault(b => b.id == bClicker.BuildingId);
-                    if (building != null && TryTarget(building.position)) return;
+                    if (building != null && TryTarget(building.position, DynamicTargetKind.Building, building.id)) return;
                     SelectBuilding(bClicker.BuildingId);
                     return;
                 }
                 var tileClicker = hit.collider.GetComponentInParent<TileClickHandler>();
                 if (tileClicker != null)
                 {
-                    if (TryTarget(tileClicker.Position)) return;
+                    if (TryTarget(tileClicker.Position, DynamicTargetKind.Tile)) return;
                     ClearSelection();
                     return;
                 }
             }
             ClearSelection();
+        }
+
+        private void TryTargetDynamicActionFromRay(Ray ray)
+        {
+            var action = targetingDynamicAction;
+            var actorId = targetingDynamicActorId;
+            if (action == null) return;
+            if (!TryGetExecutableDynamicTargets(action, actorId, out var candidates))
+            {
+                CancelTargeting(false);
+                commercialHud?.Toast("대상 검증 예산을 초과해 행동을 취소했습니다.", new Color(1f, .55f, .3f));
+                return;
+            }
+
+            var hits = Physics.RaycastAll(ray, 200f).OrderBy(value => value.distance).Take(64).ToList();
+            HexCoord? clickedTile = null;
+            var clickedTargetId = 0;
+            foreach (var hit in hits)
+            {
+                HexCoord? hitTile = null;
+                var hitTargetId = 0;
+                var tileClicker = hit.collider.GetComponentInParent<TileClickHandler>();
+                if (tileClicker != null) hitTile = tileClicker.Position;
+                var unitClicker = hit.collider.GetComponentInParent<UnitClickHandler>();
+                if (unitClicker != null)
+                {
+                    var unit = game.entities.FirstOrDefault(value => value.id == unitClicker.UnitId);
+                    if (unit != null)
+                    {
+                        hitTile = unit.position;
+                        if (action.targetSelector.kind == DynamicTargetKind.Unit) hitTargetId = unitClicker.UnitId;
+                    }
+                }
+                var buildingClicker = hit.collider.GetComponentInParent<BuildingClickHandler>();
+                if (buildingClicker != null)
+                {
+                    var building = game.buildings.FirstOrDefault(value => value.id == buildingClicker.BuildingId);
+                    if (building != null)
+                    {
+                        hitTile = building.position;
+                        if (action.targetSelector.kind == DynamicTargetKind.Building) hitTargetId = buildingClicker.BuildingId;
+                    }
+                }
+                if (!hitTile.HasValue) continue;
+                if (!clickedTile.HasValue) clickedTile = hitTile;
+                if (!hitTile.Value.Equals(clickedTile.Value)) continue;
+                if (hitTargetId > 0 && clickedTargetId == 0) clickedTargetId = hitTargetId;
+            }
+
+            var selected = clickedTile.HasValue
+                ? DynamicActionTargeting.FindClickedCandidate(
+                    candidates,
+                    action.targetSelector.kind,
+                    clickedTargetId,
+                    clickedTile.Value)
+                : null;
+            if (selected != null)
+            {
+                ExecuteDynamicAction(action, selected);
+                return;
+            }
+            commercialHud?.Toast("강조된 종류의 유효 대상을 선택하세요.", new Color(1f, .55f, .3f));
         }
     }
 

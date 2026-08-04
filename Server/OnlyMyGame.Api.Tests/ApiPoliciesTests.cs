@@ -38,10 +38,25 @@ public sealed class ApiPoliciesTests
     [Fact]
     public void TrustedProxies_AcceptsOnlyExplicitIpAddresses()
     {
-        var proxies = ApiPolicies.ParseTrustedProxies("10.0.0.2, invalid; 2001:db8::1, 10.0.0.2");
+        Assert.True(ApiPolicies.TryParseTrustedProxies(
+            "10.0.0.2; 2001:db8::1, 10.0.0.2",
+            out var proxies));
 
         Assert.Equal(new[] { IPAddress.Parse("10.0.0.2"), IPAddress.Parse("2001:db8::1") }, proxies);
+        Assert.True(ApiPolicies.TryParseTrustedProxies(null, out var unconfigured));
+        Assert.Empty(unconfigured);
         Assert.Empty(ApiPolicies.ParseTrustedProxies(null));
+    }
+
+    [Theory]
+    [InlineData("not-an-ip")]
+    [InlineData("10.0.0.2, not-an-ip")]
+    [InlineData(", ; ,")]
+    public void TrustedProxies_InvalidNonEmptyConfigurationFailsClosed(string configured)
+    {
+        Assert.False(ApiPolicies.TryParseTrustedProxies(configured, out var proxies));
+        Assert.Empty(proxies);
+        Assert.Empty(ApiPolicies.ParseTrustedProxies(configured));
     }
 
     [Fact]
@@ -79,11 +94,27 @@ public sealed class ApiPoliciesTests
     }
 
     [Fact]
+    public void RuleSetIngressRejectsActionsBeyondCommercialHudCapacity()
+    {
+        var ruleSet = new RuleSetV1
+        {
+            requestId = "action-cap",
+            koreanSummary = "상용 행동 슬롯 계약을 검증합니다.",
+            changes = new List<RuleNodeV1> { new() },
+            actions = Enumerable.Range(0, RuleLimits.MaxDynamicActionsPerRuleSet + 1)
+                .Select(index => new DynamicActionV1 { id = "action-" + index })
+                .ToList()
+        };
+
+        Assert.Contains("ACTIONS_COUNT", ApiPolicies.ValidateRuleSet(ruleSet));
+    }
+
+    [Fact]
     public void RequestLog_MigratesLegacySchemaWithoutDroppingRows()
     {
         using var database = OpenMemoryDatabase();
         using (var create = new SqliteCommand(
-            "CREATE TABLE request_log (id INTEGER PRIMARY KEY, day TEXT NOT NULL, ip_hash TEXT NOT NULL, request_key TEXT NOT NULL UNIQUE, created_utc TEXT NOT NULL, latency_ms INTEGER, valid INTEGER, error TEXT); INSERT INTO request_log(day,ip_hash,request_key,created_utc,valid,error) VALUES('2026-08-05','ip','legacy','2026-08-05T00:00:00Z',1,'');",
+            "CREATE TABLE request_log (id INTEGER PRIMARY KEY, day TEXT NOT NULL, ip_hash TEXT NOT NULL, request_key TEXT NOT NULL UNIQUE, created_utc TEXT NOT NULL, latency_ms INTEGER, valid INTEGER, error TEXT); INSERT INTO request_log(day,ip_hash,request_key,created_utc,valid,error) VALUES('2026-08-05','ip','legacy','2026-08-05T00:00:00Z',1,''); CREATE TABLE request_attempt (id INTEGER PRIMARY KEY, day TEXT NOT NULL, ip_hash TEXT NOT NULL, request_key TEXT NOT NULL, created_utc TEXT NOT NULL); INSERT INTO request_attempt(day,ip_hash,request_key,created_utc) VALUES('2026-08-05','ip','legacy','2026-08-05T00:00:00Z');",
             database))
         {
             create.ExecuteNonQuery();
@@ -115,6 +146,30 @@ public sealed class ApiPoliciesTests
         Assert.Contains("validation_failures", columns);
         using (var attemptsTable = new SqliteCommand("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='request_attempt'", database))
             Assert.Equal(1L, (long)(attemptsTable.ExecuteScalar() ?? 0L));
+        var attemptColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var attemptPragma = new SqliteCommand("PRAGMA table_info(request_attempt)", database))
+        using (var reader = attemptPragma.ExecuteReader())
+        {
+            while (reader.Read()) attemptColumns.Add(reader.GetString(1));
+        }
+        Assert.Contains("lease_token", attemptColumns);
+        Assert.Contains("completed_utc", attemptColumns);
+        Assert.Contains("latency_ms", attemptColumns);
+        Assert.Contains("valid", attemptColumns);
+        Assert.Contains("error", attemptColumns);
+        Assert.Contains("response_json", attemptColumns);
+        Assert.Contains("request_hash", attemptColumns);
+        Assert.Contains("compatibility_version", attemptColumns);
+        Assert.Contains("input_tokens", attemptColumns);
+        Assert.Contains("output_tokens", attemptColumns);
+        Assert.Contains("total_tokens", attemptColumns);
+        Assert.Contains("cached_input_tokens", attemptColumns);
+        Assert.Contains("cache_write_tokens", attemptColumns);
+        Assert.Contains("reasoning_tokens", attemptColumns);
+        Assert.Contains("upstream_attempts", attemptColumns);
+        Assert.Contains("validation_failures", attemptColumns);
+        using (var attemptCount = new SqliteCommand("SELECT COUNT(*) FROM request_attempt WHERE request_key='legacy'", database))
+            Assert.Equal(1L, (long)(attemptCount.ExecuteScalar() ?? 0L));
         using (var sessionsTable = new SqliteCommand("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='game_session'", database))
             Assert.Equal(1L, (long)(sessionsTable.ExecuteScalar() ?? 0L));
         using (var maintenanceTable = new SqliteCommand("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='service_maintenance'", database))
@@ -263,6 +318,43 @@ public sealed class ApiPoliciesTests
             Assert.False(reader.IsDBNull(12));
         }
 
+        using (var attemptAudit = new SqliteCommand(
+                   "SELECT completed_utc,latency_ms,valid,error,response_json,input_tokens,output_tokens,total_tokens,cached_input_tokens,cache_write_tokens,reasoning_tokens,upstream_attempts,validation_failures FROM request_attempt WHERE request_key='observed-key' ORDER BY id",
+                   database))
+        using (var reader = attemptAudit.ExecuteReader())
+        {
+            Assert.True(reader.Read());
+            Assert.False(reader.IsDBNull(0));
+            Assert.Equal(10L, reader.GetInt64(1));
+            Assert.Equal(0L, reader.GetInt64(2));
+            Assert.Equal("UPSTREAM_TIMEOUT", reader.GetString(3));
+            Assert.True(reader.IsDBNull(4));
+            Assert.Equal(10L, reader.GetInt64(5));
+            Assert.Equal(4L, reader.GetInt64(6));
+            Assert.Equal(14L, reader.GetInt64(7));
+            Assert.Equal(2L, reader.GetInt64(8));
+            Assert.Equal(1L, reader.GetInt64(9));
+            Assert.Equal(3L, reader.GetInt64(10));
+            Assert.Equal(1L, reader.GetInt64(11));
+            Assert.Equal(1L, reader.GetInt64(12));
+
+            Assert.True(reader.Read());
+            Assert.False(reader.IsDBNull(0));
+            Assert.Equal(20L, reader.GetInt64(1));
+            Assert.Equal(1L, reader.GetInt64(2));
+            Assert.Equal(string.Empty, reader.GetString(3));
+            Assert.Equal("winner", reader.GetString(4));
+            Assert.Equal(20L, reader.GetInt64(5));
+            Assert.Equal(8L, reader.GetInt64(6));
+            Assert.Equal(28L, reader.GetInt64(7));
+            Assert.Equal(5L, reader.GetInt64(8));
+            Assert.Equal(2L, reader.GetInt64(9));
+            Assert.Equal(6L, reader.GetInt64(10));
+            Assert.Equal(2L, reader.GetInt64(11));
+            Assert.Equal(1L, reader.GetInt64(12));
+            Assert.False(reader.Read());
+        }
+
         var replay = ApiPolicies.ClaimRuleRequest(database, "2026-08-05", "ip", "observed-key", "hash", 10, now.AddSeconds(4));
         Assert.Equal(RuleRequestClaimKind.Replay, replay.Kind);
         using var attempts = new SqliteCommand("SELECT COUNT(*) FROM request_attempt WHERE request_key='observed-key'", database);
@@ -286,6 +378,8 @@ public sealed class ApiPoliciesTests
                    INSERT INTO request_attempt(day,ip_hash,request_key,created_utc)
                    VALUES('2026-07-01','ip','old-completed',$old),
                          ('2026-08-01','ip','recent-completed',$recent);
+                   INSERT INTO request_attempt(day,ip_hash,request_key,created_utc,completed_utc,valid,error)
+                   VALUES('2026-07-01','ip','recently-completed-audit',$old,$withinMinimum,0,'UPSTREAM_TIMEOUT');
                    INSERT INTO game_session(token_hash,run_id,ip_hash,created_utc,expires_utc)
                    VALUES('expired','run-old','ip',$old,$expired),
                          ('live','run-live','ip',$recent,$live);
@@ -315,6 +409,7 @@ public sealed class ApiPoliciesTests
         Assert.Equal(1L, CountRows(database, "request_log", "request_key='recent-lease' AND valid IS NULL AND lease_token='recent-lease-token'"));
         Assert.Equal(0L, CountRows(database, "request_attempt", "request_key='old-completed'"));
         Assert.Equal(1L, CountRows(database, "request_attempt", "request_key='recent-completed'"));
+        Assert.Equal(1L, CountRows(database, "request_attempt", "request_key='recently-completed-audit' AND error='UPSTREAM_TIMEOUT'"));
         Assert.Equal(0L, CountRows(database, "game_session", "token_hash='expired'"));
         Assert.Equal(1L, CountRows(database, "game_session", "token_hash='live'"));
 
@@ -369,25 +464,208 @@ public sealed class ApiPoliciesTests
     }
 
     [Fact]
-    public void CanonicalRequestHash_IgnoresRetryTransientStateOnly()
+    public void CanonicalRequestHash_IgnoresRetryDiagnosticsButIncludesLifecycle()
     {
         var snapshot = MinimalSnapshot();
         snapshot.phase = RunPhase.AwaitingRules;
-        snapshot.planningPrepared = true;
+        snapshot.planningPrepared = false;
         snapshot.journal.Add("first request failed");
         snapshot.ruleBudget = new RuleRuntimeBudget { turn = snapshot.turn, dispatches = 3 };
         var before = ApiPolicies.ComputeRuleRequestHash(snapshot);
 
-        snapshot.phase = RunPhase.Planning;
-        snapshot.planningPrepared = false;
         snapshot.journal.Add("retrying");
         snapshot.ruleBudget.effects = 99;
         var afterTransientChanges = ApiPolicies.ComputeRuleRequestHash(snapshot);
+        snapshot.planningPrepared = true;
+        var afterPreparationChange = ApiPolicies.ComputeRuleRequestHash(snapshot);
+        snapshot.planningPrepared = false;
+        snapshot.phase = RunPhase.Planning;
+        var afterPhaseChange = ApiPolicies.ComputeRuleRequestHash(snapshot);
+        snapshot.phase = RunPhase.AwaitingRules;
         snapshot.luck++;
         var afterGameplayChange = ApiPolicies.ComputeRuleRequestHash(snapshot);
 
         Assert.Equal(before, afterTransientChanges);
+        Assert.NotEqual(before, afterPreparationChange);
+        Assert.NotEqual(before, afterPhaseChange);
         Assert.NotEqual(before, afterGameplayChange);
+    }
+
+    [Fact]
+    public void RuleGenerationSnapshot_RequiresValidAwaitingOngoingLifecycle()
+    {
+        var snapshot = MinimalSnapshot();
+        snapshot.phase = RunPhase.AwaitingRules;
+        snapshot.outcome = RunOutcome.Ongoing;
+        snapshot.planningPrepared = false;
+        Assert.DoesNotContain("RULE_GENERATION_LIFECYCLE_INVALID", ApiPolicies.ValidateSnapshot(snapshot));
+
+        snapshot.phase = RunPhase.Planning;
+        Assert.Contains("RULE_GENERATION_LIFECYCLE_INVALID", ApiPolicies.ValidateSnapshot(snapshot));
+        snapshot.phase = (RunPhase)999;
+        Assert.Contains("PHASE_INVALID", ApiPolicies.ValidateSnapshot(snapshot));
+
+        snapshot.phase = RunPhase.AwaitingRules;
+        snapshot.outcome = (RunOutcome)999;
+        Assert.Contains("OUTCOME_INVALID", ApiPolicies.ValidateSnapshot(snapshot));
+
+        snapshot.outcome = RunOutcome.Ongoing;
+        snapshot.planningPrepared = true;
+        Assert.Contains("RULE_GENERATION_LIFECYCLE_INVALID", ApiPolicies.ValidateSnapshot(snapshot));
+    }
+
+    [Fact]
+    public void CanonicalRequestHash_PreservesExpressionInputsAcrossTheWire()
+    {
+        var snapshot = MinimalSnapshot();
+        snapshot.typedRuleState.Add(new TypedRuleStateEntryV1
+        {
+            scope = RuleStateScope.Run,
+            scopeId = "",
+            key = "momentum",
+            valueType = RuleStateValueType.Number,
+            koreanName = "기세",
+            iconToken = "momentum",
+            colorHex = "#33AAFF",
+            numberValue = 3
+        });
+        snapshot.recentActionStats.Add(new ActionTurnStatV1 { turn = snapshot.turn, type = CommandType.Move, count = 2 });
+        var wireOptions = new JsonSerializerOptions { IncludeFields = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+        wireOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter(JsonNamingPolicy.CamelCase));
+        var roundTripped = JsonSerializer.Deserialize<GameSnapshotV1>(JsonSerializer.Serialize(snapshot, wireOptions), wireOptions)!;
+
+        var originalHash = ApiPolicies.ComputeRuleRequestHash(snapshot);
+
+        Assert.Equal(originalHash, ApiPolicies.ComputeRuleRequestHash(roundTripped));
+        roundTripped.typedRuleState.Single().numberValue++;
+        Assert.NotEqual(originalHash, ApiPolicies.ComputeRuleRequestHash(roundTripped));
+        roundTripped.typedRuleState.Single().numberValue--;
+        roundTripped.recentActionStats.Single().count++;
+        Assert.NotEqual(originalHash, ApiPolicies.ComputeRuleRequestHash(roundTripped));
+    }
+
+    [Fact]
+    public void CanonicalRequestHash_IsStableAfterPreparedTurnStateRestart()
+    {
+        var snapshot = MinimalSnapshot();
+        snapshot.turn = 1;
+        var definition = new StateDefinitionV1
+        {
+            scope = RuleStateScope.Turn,
+            scopeId = "",
+            key = "restart_turn_state",
+            valueType = RuleStateValueType.Number,
+            koreanName = "재시작 턴 상태",
+            iconToken = "restart_turn",
+            colorHex = "#33AAFF",
+            initialNumber = 4
+        };
+        snapshot.activeRules.Add(new RuleNodeV1
+        {
+            id = "restart-turn-owner",
+            appliedTurn = 1,
+            durationTurns = 10,
+            stateDefinitions = new List<StateDefinitionV1> { definition }
+        });
+        Assert.True(RuleExpressionRuntime.EnsureActiveDefinitions(snapshot));
+        Assert.True(RuleExpressionRuntime.ApplyStateMutation(new StateMutationV1
+        {
+            op = StateMutationOp.Set,
+            state = new StateReferenceV1 { scope = RuleStateScope.Turn, scopeId = "", key = definition.key },
+            numberValue = new NumberExpressionV1 { op = NumberExpressionOp.Constant, constant = 99 }
+        }, snapshot));
+
+        snapshot.turn = 2;
+        var staleHash = ApiPolicies.ComputeRuleRequestHash(snapshot);
+        Assert.True(RuleExpressionRuntime.EnsureActiveDefinitions(snapshot));
+        var preparedHash = ApiPolicies.ComputeRuleRequestHash(snapshot);
+        Assert.NotEqual(staleHash, preparedHash);
+
+        var wireOptions = new JsonSerializerOptions { IncludeFields = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+        wireOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter(JsonNamingPolicy.CamelCase));
+        var restarted = JsonSerializer.Deserialize<GameSnapshotV1>(JsonSerializer.Serialize(snapshot, wireOptions), wireOptions)!;
+        Assert.True(RuleExpressionRuntime.EnsureActiveDefinitions(restarted));
+
+        Assert.Equal(preparedHash, ApiPolicies.ComputeRuleRequestHash(restarted));
+        Assert.Equal(snapshot.turn, restarted.typedRuleState.Single().stateTurn);
+        Assert.Equal(definition.initialNumber, restarted.typedRuleState.Single().numberValue);
+    }
+
+    [Fact]
+    public void PublicRuleDesignerSnapshot_PreservesKnownWorldAndMasksFoggedSecretsWithoutMutatingSource()
+    {
+        var snapshot = MinimalSnapshot();
+        snapshot.factions = new List<FactionState>
+        {
+            new() { id = 1, name = "플레이어", kind = FactionKind.Player },
+            new() { id = 2, name = "적", kind = FactionKind.Skeleton }
+        };
+        snapshot.map = new List<TileState>
+        {
+            new() { position = new HexCoord(0, 0), terrain = "초원", resource = ResourceType.Food, amount = 6, owner = 1, explored = true, visible = true },
+            new() { position = new HexCoord(1, 0), terrain = "숲", resource = ResourceType.Wood, amount = 5, owner = 2, explored = true, visible = true },
+            new() { position = new HexCoord(2, 0), terrain = "언덕", resource = ResourceType.Stone, amount = 9, owner = 2, explored = true, visible = false },
+            new() { position = new HexCoord(3, 0), terrain = "비밀 지형", resource = ResourceType.Iron, amount = 7, owner = 2, explored = false, visible = false },
+            new() { position = new HexCoord(4, 0), terrain = "초원", resource = ResourceType.Food, amount = 4, owner = 1, explored = true, visible = false }
+        };
+        snapshot.entities = new List<UnitState>
+        {
+            new() { id = 10, factionId = 1, position = new HexCoord(4, 0) },
+            new() { id = 20, factionId = 2, position = new HexCoord(1, 0) },
+            new() { id = 30, factionId = 2, position = new HexCoord(2, 0) },
+            new() { id = 40, factionId = 2, position = new HexCoord(3, 0) }
+        };
+        snapshot.buildings = new List<BuildingState>
+        {
+            new() { id = 100, factionId = 1, position = new HexCoord(4, 0), type = BuildingType.Headquarters },
+            new() { id = 200, factionId = 2, position = new HexCoord(1, 0), type = BuildingType.Watchtower },
+            new() { id = 300, factionId = 2, position = new HexCoord(2, 0), type = BuildingType.Barracks },
+            new() { id = 400, factionId = 2, position = new HexCoord(3, 0), type = BuildingType.Warehouse }
+        };
+        var serializationOptions = new JsonSerializerOptions { IncludeFields = true };
+        var sourceBeforeProjection = JsonSerializer.Serialize(snapshot, serializationOptions);
+
+        var publicSnapshot = ApiPolicies.BuildPublicRuleDesignerSnapshot(snapshot);
+
+        Assert.NotSame(snapshot, publicSnapshot);
+        Assert.NotSame(snapshot.map, publicSnapshot.map);
+        Assert.NotSame(snapshot.entities, publicSnapshot.entities);
+        Assert.NotSame(snapshot.buildings, publicSnapshot.buildings);
+        Assert.Equal(sourceBeforeProjection, JsonSerializer.Serialize(snapshot, serializationOptions));
+        Assert.Equal(new[] { 10, 20 }, publicSnapshot.entities.Select(unit => unit.id));
+        Assert.Equal(new[] { 100, 200 }, publicSnapshot.buildings.Select(building => building.id));
+
+        var visibleEnemyTile = publicSnapshot.map.Single(tile => tile.position.Equals(new HexCoord(1, 0)));
+        Assert.Equal("숲", visibleEnemyTile.terrain);
+        Assert.Equal(ResourceType.Wood, visibleEnemyTile.resource);
+        Assert.Equal(5, visibleEnemyTile.amount);
+        Assert.Equal(2, visibleEnemyTile.owner);
+        Assert.True(visibleEnemyTile.explored);
+        Assert.True(visibleEnemyTile.visible);
+
+        var rememberedEnemyTile = publicSnapshot.map.Single(tile => tile.position.Equals(new HexCoord(2, 0)));
+        Assert.Equal("언덕", rememberedEnemyTile.terrain);
+        Assert.Equal(ResourceType.Stone, rememberedEnemyTile.resource);
+        Assert.Equal(0, rememberedEnemyTile.amount);
+        Assert.Equal(0, rememberedEnemyTile.owner);
+        Assert.True(rememberedEnemyTile.explored);
+        Assert.False(rememberedEnemyTile.visible);
+
+        var unexploredTile = publicSnapshot.map.Single(tile => tile.position.Equals(new HexCoord(3, 0)));
+        Assert.Equal("미탐사", unexploredTile.terrain);
+        Assert.Equal(ResourceType.None, unexploredTile.resource);
+        Assert.Equal(0, unexploredTile.amount);
+        Assert.Equal(0, unexploredTile.owner);
+        Assert.False(unexploredTile.explored);
+        Assert.False(unexploredTile.visible);
+
+        var rememberedPlayerTile = publicSnapshot.map.Single(tile => tile.position.Equals(new HexCoord(4, 0)));
+        Assert.Equal("초원", rememberedPlayerTile.terrain);
+        Assert.Equal(ResourceType.Food, rememberedPlayerTile.resource);
+        Assert.Equal(4, rememberedPlayerTile.amount);
+        Assert.Equal(1, rememberedPlayerTile.owner);
+        Assert.True(rememberedPlayerTile.explored);
+        Assert.False(rememberedPlayerTile.visible);
     }
 
     [Fact]
@@ -423,6 +701,14 @@ public sealed class ApiPoliciesTests
 
         Assert.Equal(RuleRequestClaimKind.Claimed, reclaimed.Kind);
         Assert.Equal("COMPATIBILITY_VERSION_CHANGED", reclaimed.PreviousError);
+        using var audit = new SqliteCommand(
+            "SELECT valid,error,response_json FROM request_attempt WHERE request_key='versioned' ORDER BY id LIMIT 1",
+            database);
+        using var reader = audit.ExecuteReader();
+        Assert.True(reader.Read());
+        Assert.Equal(1L, reader.GetInt64(0));
+        Assert.Equal(string.Empty, reader.GetString(1));
+        Assert.Equal("cached", reader.GetString(2));
     }
 
     [Fact]
@@ -557,6 +843,7 @@ public sealed class ApiPoliciesTests
         return new GameSnapshotV1
         {
             runId = "run",
+            phase = RunPhase.AwaitingRules,
             catalogHash = "catalog",
             map = new List<TileState> { new() },
             factions = new List<FactionState> { new() { kind = FactionKind.Player } }
