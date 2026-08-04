@@ -53,6 +53,7 @@
     <Analyzer Include="/Applications/Unity/Hub/Editor/6000.5.6f1/Unity.app/Contents/Resources/Scripting/BCLExtensions/TargetingPacks/netstandard2.1/analyzers/dotnet/roslyn4.0/cs/System.Text.Json.SourceGeneration.dll" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Assets/Editor/OnlyMyGameWebGlPostprocessor.cs" />
     <Compile Include="Assets/Editor/BuildScript.cs" />
   </ItemGroup>
   <ItemGroup>
@@ -1402,7 +1403,6 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="Assembly-CSharp.csproj" />
     <ProjectReference Include="OnlyMyGame.Runtime.csproj" />
   </ItemGroup>
   <Import Project="Sdk.targets" Sdk="Microsoft.NET.Sdk" />

@@ -846,7 +846,7 @@ public sealed class ApiPoliciesTests
             phase = RunPhase.AwaitingRules,
             catalogHash = "catalog",
             map = new List<TileState> { new() },
-            factions = new List<FactionState> { new() { kind = FactionKind.Player } }
+            factions = new List<FactionState> { new() { id = 1, kind = FactionKind.Player } }
         };
     }
 
