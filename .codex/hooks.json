@@ -1,14 +1,14 @@
 {
-  "description": "Deploy the NAS API after Codex finishes a turn that changed API sources.",
+  "description": "Run local API verification when a Codex task stops; production deployment is always manual.",
   "hooks": {
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "\"$(git rev-parse --show-toplevel)/scripts/deploy-nas-api.sh\"",
-            "timeout": 180,
-            "statusMessage": "Checking whether the NAS API needs deployment"
+            "command": "\"$(git rev-parse --show-toplevel)/scripts/verify-server.sh\"",
+            "timeout": 300,
+            "statusMessage": "Verifying OnlyMyGame API tests and Release build"
           }
         ]
       }

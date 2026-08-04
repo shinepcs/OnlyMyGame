@@ -8,6 +8,8 @@ UserSettings
 build/Build
 build.app
 build
+artifacts/
+TestResults/
 .DS_Store
 apikey.txt
 sshpw.txt
@@ -20,3 +22,6 @@ actions-runner
 *.slnx
 OnlyMyGame.Runtime.csproj
 OnlyMyGame.Tests.csproj
+/*.csproj
+__pycache__/
+*.py[cod]

@@ -3,12 +3,16 @@ services:
     build:
       context: .
       dockerfile: Server/OnlyMyGame.Api/Dockerfile
-    ports: ["8080:8080"]
+    ports: ["127.0.0.1:8080:8080"]
     volumes: ["onlymygame-data:/data"]
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY:?set in NAS secret or environment}
       ONLYMYGAME_ALLOWED_ORIGIN: ${ONLYMYGAME_ALLOWED_ORIGIN:?GitHub Pages origin}
-      ONLYMYGAME_DAILY_SALT: ${ONLYMYGAME_DAILY_SALT:?daily hashing secret}
+      ONLYMYGAME_DAILY_SALT: ${ONLYMYGAME_DAILY_SALT:?stable high-entropy hashing secret}
+      ONLYMYGAME_TRUSTED_PROXIES: ${ONLYMYGAME_TRUSTED_PROXIES:?Synology reverse proxy source IP}
+      ONLYMYGAME_GLOBAL_DAILY_LIMIT: ${ONLYMYGAME_GLOBAL_DAILY_LIMIT:?production-wide daily OpenAI request limit}
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     restart: unless-stopped
 volumes:
   onlymygame-data:

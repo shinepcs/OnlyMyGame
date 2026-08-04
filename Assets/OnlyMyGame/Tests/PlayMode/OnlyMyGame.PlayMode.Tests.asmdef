@@ -1,12 +1,10 @@
 {
-  "name": "OnlyMyGame.Tests",
+  "name": "OnlyMyGame.PlayMode.Tests",
   "rootNamespace": "OnlyMyGame.Tests",
   "references": [
     "OnlyMyGame.Runtime"
   ],
-  "includePlatforms": [
-    "Editor"
-  ],
+  "includePlatforms": [],
   "excludePlatforms": [],
   "allowUnsafeCode": false,
   "overrideReferences": true,

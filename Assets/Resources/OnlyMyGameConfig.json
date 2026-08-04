@@ -1,4 +1,5 @@
 {
   "apiBaseUrl": "https://office.trollgames.co.kr:10433",
-  "schemaVersion": "v1"
+  "schemaVersion": "v1",
+  "compatibilityVersion": "rules-v2-strict-2026-08"
 }

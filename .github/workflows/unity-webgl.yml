@@ -1,20 +1,53 @@
 name: Unity WebGL
+
 on:
   push:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
 permissions:
   contents: read
+
 jobs:
-  test-and-build:
-    runs-on: [self-hosted, Windows, unity-6000.5.6f1]
+  server-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-        with: { lfs: true }
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Test and build API
+        run: ./scripts/verify-server.sh
+
+  test-and-build:
+    needs: server-validation
+    # Unity editor scripts are arbitrary code. A maintainer must apply the label
+    # to the current revision before it is allowed onto the persistent runner.
+    # A later synchronize event is intentionally skipped until the label is
+    # removed and applied again, so an old approval cannot authorize new code.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'labeled' &&
+       github.event.label.name == 'safe-to-run-unity' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'safe-to-run-unity'))
+    runs-on: [self-hosted, Windows, unity-6000.5.6f1]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          persist-credentials: false
       - name: Resolve Unity executable
-        shell: pwsh
+        shell: powershell -ExecutionPolicy Bypass -File {0}
         env:
           UNITY_PATH: ${{ vars.UNITY_PATH }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $unityPath = $env:UNITY_PATH
           $unityVersion = (Select-String -Path 'ProjectSettings/ProjectVersion.txt' -Pattern '^m_EditorVersion:' |
             Select-Object -First 1).Line -replace '^m_EditorVersion:\s*', ''
@@ -31,21 +64,90 @@ jobs:
           ) | Where-Object { $_ }
 
           $unityPath = $candidatePaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-
           if (-not $unityPath) {
-            throw "Unity $unityVersion was not found. Set the UNITY_PATH repository variable or install it under C:\Program Files\Unity\Hub\Editor or D:\UnityEditor."
+            throw "Unity $unityVersion was not found. Set UNITY_PATH or install the exact project editor version."
           }
 
+          New-Item -ItemType Directory -Force -Path 'artifacts\unity\test-results', 'artifacts\unity\logs' | Out-Null
           "UNITY_PATH=$unityPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Using Unity: $unityPath"
+
       - name: EditMode tests
-        shell: pwsh
-        run: '& "${env:UNITY_PATH}" -batchmode -nographics -quit -projectPath $PWD -runTests -testPlatform EditMode -testResults TestResults/editmode.xml'
+        shell: powershell -ExecutionPolicy Bypass -File {0}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $resultPath = Join-Path $env:GITHUB_WORKSPACE 'artifacts\unity\test-results\editmode.xml'
+          $logPath = Join-Path $env:GITHUB_WORKSPACE 'artifacts\unity\logs\editmode.log'
+          & $env:UNITY_PATH -batchmode -nographics -quit -projectPath $env:GITHUB_WORKSPACE -runTests -testPlatform EditMode -testResults $resultPath -logFile $logPath
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            if (Test-Path $logPath) { Get-Content $logPath | Select-Object -Last 160 }
+            throw "EditMode tests failed with exit code $exitCode."
+          }
+          if (-not (Test-Path $resultPath)) { throw 'EditMode result XML was not created.' }
+
       - name: PlayMode tests
-        shell: pwsh
-        run: '& "${env:UNITY_PATH}" -batchmode -nographics -quit -projectPath $PWD -runTests -testPlatform PlayMode -testResults TestResults/playmode.xml'
+        shell: powershell -ExecutionPolicy Bypass -File {0}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $resultPath = Join-Path $env:GITHUB_WORKSPACE 'artifacts\unity\test-results\playmode.xml'
+          $logPath = Join-Path $env:GITHUB_WORKSPACE 'artifacts\unity\logs\playmode.log'
+          & $env:UNITY_PATH -batchmode -nographics -quit -projectPath $env:GITHUB_WORKSPACE -runTests -testPlatform PlayMode -testResults $resultPath -logFile $logPath
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            if (Test-Path $logPath) { Get-Content $logPath | Select-Object -Last 160 }
+            throw "PlayMode tests failed with exit code $exitCode."
+          }
+          if (-not (Test-Path $resultPath)) { throw 'PlayMode result XML was not created.' }
+
+      - name: Validate Unity test reports
+        shell: powershell -ExecutionPolicy Bypass -File {0}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('editmode.xml', 'playmode.xml')) {
+            $path = Join-Path $env:GITHUB_WORKSPACE "artifacts\unity\test-results\$name"
+            [xml]$document = Get-Content -LiteralPath $path -Raw
+            $root = $document.DocumentElement
+            $countText = $root.GetAttribute('testcasecount')
+            if ([string]::IsNullOrWhiteSpace($countText)) { $countText = $root.GetAttribute('total') }
+            [int]$count = 0
+            $countParsed = [int]::TryParse($countText, [ref]$count)
+            if (-not $countParsed -or $count -lt 1) {
+              throw "$name did not execute any tests."
+            }
+            $failedText = $root.GetAttribute('failed')
+            [int]$failed = 0
+            if (-not [string]::IsNullOrWhiteSpace($failedText)) { [void][int]::TryParse($failedText, [ref]$failed) }
+            if ($failed -gt 0 -or $root.GetAttribute('result') -eq 'Failed') {
+              throw "$name reports $failed failed tests."
+            }
+            Write-Host ("{0}: {1} tests, {2} failed" -f $name, $count, $failed)
+          }
+
       - name: WebGL build
-        shell: pwsh
-        run: '& "${env:UNITY_PATH}" -batchmode -nographics -quit -projectPath $PWD -executeMethod BuildScript.BuildWebGL'
-      - uses: actions/upload-artifact@v4
-        with: { name: webgl, path: build/webgl }
+        shell: powershell -ExecutionPolicy Bypass -File {0}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $logPath = Join-Path $env:GITHUB_WORKSPACE 'artifacts\unity\logs\build-webgl.log'
+          & $env:UNITY_PATH -batchmode -nographics -quit -projectPath $env:GITHUB_WORKSPACE -buildTarget WebGL -executeMethod BuildScript.BuildWebGL -logFile $logPath
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            if (Test-Path $logPath) { Get-Content $logPath | Select-Object -Last 160 }
+            throw "WebGL build failed with exit code $exitCode."
+          }
+          if (-not (Test-Path 'build\webgl\index.html')) { throw 'WebGL index.html was not created.' }
+
+      - name: Upload Unity diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unity-diagnostics
+          path: artifacts/unity
+          if-no-files-found: warn
+
+      - name: Upload WebGL build
+        uses: actions/upload-artifact@v4
+        with:
+          name: webgl
+          path: build/webgl
+          if-no-files-found: error

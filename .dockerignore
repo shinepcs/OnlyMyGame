@@ -5,8 +5,17 @@
 Library
 Logs
 Temp
+build
+artifacts
 obj
 bin
+Server/OnlyMyGame.Api.Tests
+Assets/*
+!Assets/OnlyMyGame/
+Assets/OnlyMyGame/*
+!Assets/OnlyMyGame/Core/
+Assets/OnlyMyGame/Core/*
+!Assets/OnlyMyGame/Core/RuleCore.cs
 apikey.txt
 sshpw.txt
 .env

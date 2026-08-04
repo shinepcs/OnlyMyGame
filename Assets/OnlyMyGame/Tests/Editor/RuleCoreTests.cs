@@ -38,9 +38,9 @@ namespace OnlyMyGame.Tests
         {
             var game = WorldLike(5);
             game.entities.Clear();
-            game.entities.Add(new UnitState { id = 1, factionId = 1, position = new HexCoord(0, 0), speed = 2 });
-            game.entities.Add(new UnitState { id = 2, factionId = 2, position = new HexCoord(1, 0), speed = 2 });
-            var target = new HexCoord(2, 0);
+            game.entities.Add(new UnitState { id = 1, factionId = 1, position = new HexCoord(-1, 0), speed = 2 });
+            game.entities.Add(new UnitState { id = 2, factionId = 2, position = new HexCoord(0, -1), speed = 2 });
+            var target = new HexCoord(0, 0);
             var commands = new List<PlannedCommand>
             {
                 new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Move, target = target },
@@ -60,8 +60,7 @@ namespace OnlyMyGame.Tests
             game.entities.Add(new UnitState { id = 2, factionId = 2, position = new HexCoord(1, 0), hp = 2 });
             var commands = new List<PlannedCommand>
             {
-                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Attack, target = new HexCoord(1, 0) },
-                new PlannedCommand { factionId = 2, unitId = 2, type = CommandType.Attack, target = new HexCoord(0, 0) }
+                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Attack, target = new HexCoord(1, 0) }
             };
             var log = new List<string>();
             TurnResolver.Resolve(game, commands, new DeterministicRandom(7), log);
@@ -79,7 +78,7 @@ namespace OnlyMyGame.Tests
             player.resources.food = 5;
             var commands = new List<PlannedCommand>
             {
-                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Trade, target = new HexCoord(0, 0) },
+                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Trade, target = new HexCoord(1, 0) },
                 new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Attack, target = new HexCoord(1, 0) }
             };
             var log = new List<string>();
@@ -96,7 +95,7 @@ namespace OnlyMyGame.Tests
             var player = game.factions.First(f => f.id == 1);
             player.resources.food = 28; // 기본 상한 30에 근접
             game.buildings.Add(new BuildingState { id = 50, factionId = 1, type = BuildingType.Warehouse, level = 2 });
-            GameRules.StartTurn(game);
+            TurnResolver.BeginPlanning(game, new List<string>());
             Assert.AreEqual(50, player.resources.maxFood, "창고 레벨 합계 2이면 상한이 30+20=50이어야 합니다.");
             Assert.AreEqual(50, player.resources.maxCoin);
         }
@@ -107,7 +106,7 @@ namespace OnlyMyGame.Tests
             var player = game.factions.First(f => f.id == 1);
             var before = player.resources.iron;
             game.buildings.Add(new BuildingState { id = 51, factionId = 1, type = BuildingType.Workshop, level = 3 });
-            GameRules.StartTurn(game);
+            TurnResolver.BeginPlanning(game, new List<string>());
             Assert.AreEqual(before + 3, player.resources.iron, "작업장 레벨 3이면 철 3을 생산해야 합니다.");
         }
 
@@ -125,7 +124,7 @@ namespace OnlyMyGame.Tests
             var player = game.factions.First(f => f.id == 1);
             Assert.AreEqual(10, player.maxSp);
             game.buildings.Add(new BuildingState { id = 53, factionId = 1, type = BuildingType.Barracks, level = 1 });
-            GameRules.StartTurn(game);
+            TurnResolver.BeginPlanning(game, new List<string>());
             Assert.GreaterOrEqual(player.maxSp, 11, "병영이 있으면 최대 SP가 증가해야 합니다.");
         }
 
@@ -187,7 +186,11 @@ namespace OnlyMyGame.Tests
         {
             var game = WorldLike(13);
             var player = game.factions.First(f => f.id == 1);
+            game.entities.Add(new UnitState { id = 1, factionId = 1, position = new HexCoord(0, 0) });
+            game.buildings.Add(new BuildingState { id = 1, factionId = 1, position = new HexCoord(0, 1), type = BuildingType.Headquarters });
+            game.planningPrepared = true;
             player.sp = 1;
+            player.resources.wood = player.resources.maxWood;
             var commands = new List<PlannedCommand>
             {
                 new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Build, target = new HexCoord(0, 0) }
@@ -200,15 +203,14 @@ namespace OnlyMyGame.Tests
         private static string RunDeterministic(int seed)
         {
             var game = WorldLike(seed);
-            game.entities.Add(new UnitState { id = 1, factionId = 1, position = new HexCoord(0, 0) });
+            game.entities.Add(new UnitState { id = 1, factionId = 1, position = new HexCoord(0, 1) });
             game.entities.Add(new UnitState { id = 2, factionId = 2, position = new HexCoord(3, -1) });
             game.entities.Add(new UnitState { id = 3, factionId = 2, position = new HexCoord(4, -1) });
             game.buildings.Add(new BuildingState { id = 1, factionId = 1, position = new HexCoord(0, 0), type = BuildingType.Headquarters });
             game.activeRules.Add(new RuleNodeV1 { id = "test-rule", name = "테스트 규칙", trigger = EventType.TurnStart, durationTurns = 30, appliedTurn = 1, effects = new List<EffectNode> { new EffectNode { type = EffectType.Resource, resource = ResourceType.Food, amount = 1 } } });
             var commands = new List<PlannedCommand>
             {
-                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Gather, target = new HexCoord(0, 0) },
-                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Hunt, target = new HexCoord(0, 0) }
+                new PlannedCommand { factionId = 1, unitId = 1, type = CommandType.Hunt, target = new HexCoord(0, 1) }
             };
             var log = new List<string>();
             for (var turn = 0; turn < 5; turn++)
