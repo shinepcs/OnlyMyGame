@@ -12,6 +12,7 @@ build
 apikey.txt
 sshpw.txt
 .env
+.codex/state/
 Server/**/bin/
 Server/**/obj/
 .freebuff/

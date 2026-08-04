@@ -4,7 +4,7 @@ COPY Server/OnlyMyGame.Api/OnlyMyGame.Api.csproj Server/OnlyMyGame.Api/
 COPY Assets/OnlyMyGame/Core/RuleCore.cs Assets/OnlyMyGame/Core/
 RUN dotnet restore Server/OnlyMyGame.Api/OnlyMyGame.Api.csproj
 COPY Server/OnlyMyGame.Api/ Server/OnlyMyGame.Api/
-RUN dotnet publish Server/OnlyMyGame.Api/OnlyMyGame.Api.csproj -c Release -o /app/publish --no-restore
+RUN dotnet publish Server/OnlyMyGame.Api/OnlyMyGame.Api.csproj -c Release -o /app/publish
 FROM mcr.microsoft.com/dotnet/aspnet:8.0
 WORKDIR /app
 COPY --from=build /app/publish .

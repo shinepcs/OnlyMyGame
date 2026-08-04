@@ -3,6 +3,7 @@ using UnityEditor.SceneManagement;
 using System.IO;
 using UnityEditor.Build.Reporting;
 using System;
+using UnityEngine;
 
 public class BuildScript
 {
@@ -27,6 +28,46 @@ public class BuildScript
         PlayerSettings.WebGL.decompressionFallback = true;
         PlayerSettings.WebGL.threadsSupport = false;
 
+        // WebGL 빌드에서 URP 쉐이더가 제거되지 않도록 항상 포함시킨다.
+        EnsureShaderIncluded("Universal Render Pipeline/Lit");
+        EnsureShaderIncluded("Universal Render Pipeline/Simple Lit");
+        EnsureShaderIncluded("Universal Render Pipeline/Unlit");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/CameraMotionVectors");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/Blit");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/CopyDepth");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/CopyColor");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/FinalBlit");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/PostProcessing");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/UberPost");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/DepthOfField");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/MotionBlur");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/PaniniProjection");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/LensFlareDataDriven");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/ScreenSpaceLensFlare");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/StencilDeferred");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/Deferred");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/GBuffer");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/ShadowCasterPass");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/DepthOnlyPass");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/MainLightShadowCasterPass");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/AdditionalLightsShadowCasterPass");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/SceneViewPicking");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/SceneSelection");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D/Shadow2D");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D/Sprite-Lit-Default");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D/Sprite-Unlit-Default");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D/SpriteMask");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D/SpriteShadowCasterPass");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D/SpriteLight");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D/SpriteLightOcclusion");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D/SpriteLightVolume");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D/SpriteLightVolumeOcclusion");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D/SpriteNormalMap");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D/SpriteNormalMapOcclusion");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D/SpriteNormalMapVolume");
+        EnsureShaderIncluded("Hidden/Universal Render Pipeline/2D/SpriteNormalMapVolumeOcclusion");
+
         // WebGL 빌드 옵션
         BuildPlayerOptions buildOptions = new BuildPlayerOptions
         {
@@ -48,6 +89,25 @@ public class BuildScript
         {
             EditorApplication.Exit(1);
         }
+    }
+
+    private static void EnsureShaderIncluded(string shaderName)
+    {
+        var shader = Shader.Find(shaderName);
+        if (shader == null) return;
+        var graphicsSettings = AssetDatabase.LoadAllAssetsAtPath("ProjectSettings/GraphicsSettings.asset");
+        if (graphicsSettings == null || graphicsSettings.Length == 0) return;
+        var serializedObject = new SerializedObject(graphicsSettings[0]);
+        var alwaysIncluded = serializedObject.FindProperty("m_AlwaysIncludedShaders");
+        if (alwaysIncluded == null) return;
+        for (int i = 0; i < alwaysIncluded.arraySize; i++)
+        {
+            if (alwaysIncluded.GetArrayElementAtIndex(i).objectReferenceValue == shader) return;
+        }
+        alwaysIncluded.InsertArrayElementAtIndex(alwaysIncluded.arraySize);
+        alwaysIncluded.GetArrayElementAtIndex(alwaysIncluded.arraySize - 1).objectReferenceValue = shader;
+        serializedObject.ApplyModifiedProperties();
+        AssetDatabase.SaveAssets();
     }
 
     private static string[] GetScenePathsFromSettings()

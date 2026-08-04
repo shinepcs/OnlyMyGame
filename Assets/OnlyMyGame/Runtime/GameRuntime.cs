@@ -47,8 +47,22 @@ namespace OnlyMyGame.Runtime
         [Serializable] private sealed class ClientConfig { public string apiBaseUrl; }
         private const string SaveKey = "onlymygame.autosave.v1"; private const string BackupKey = "onlymygame.autosave.v1.backup";
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)] static void Create() { if (FindFirstObjectByType<GameController>() == null) new GameObject("OnlyMyGame").AddComponent<GameController>(); }
-        private void Awake() { var config = Resources.Load<TextAsset>("OnlyMyGameConfig"); apiBase = config == null ? Environment.GetEnvironmentVariable("ONLYMYGAME_API_URL") ?? "" : JsonUtility.FromJson<ClientConfig>(config.text).apiBaseUrl ?? ""; presentation = Resources.Load<GamePresentationCatalog>("OnlyMyGamePresentation"); LoadOrNew(); }
-        private void BuildGui() { header = new GUIStyle(GUI.skin.label) { fontSize = 22, fontStyle = FontStyle.Bold, normal = { textColor = Color.white } }; body = new GUIStyle(GUI.skin.label) { fontSize = 14, wordWrap = true, normal = { textColor = Color.white } }; button = new GUIStyle(GUI.skin.button) { fontSize = 14 }; }
+        private void Awake()
+        {
+            var config = Resources.Load<TextAsset>("OnlyMyGameConfig");
+            var configuredApiBase = config == null ? "" : JsonUtility.FromJson<ClientConfig>(config.text).apiBaseUrl ?? "";
+            apiBase = IsUsableApiBase(configuredApiBase) ? configuredApiBase : Environment.GetEnvironmentVariable("ONLYMYGAME_API_URL") ?? "";
+            presentation = Resources.Load<GamePresentationCatalog>("OnlyMyGamePresentation"); LoadOrNew();
+        }
+        private void BuildGui()
+        {
+            var font = Resources.Load<Font>("Fonts/NanumGothic-Regular");
+            if (font == null) font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+            header = new GUIStyle(GUI.skin.label) { fontSize = 22, fontStyle = FontStyle.Bold, normal = { textColor = Color.white } };
+            body = new GUIStyle(GUI.skin.label) { fontSize = 14, wordWrap = true, normal = { textColor = Color.white } };
+            button = new GUIStyle(GUI.skin.button) { fontSize = 14 };
+            if (font != null) { header.font = font; body.font = font; button.font = font; }
+        }
         private void LoadOrNew() { try { var saved = ReadSave(SaveKey) ?? ReadSave(BackupKey); game = saved ?? WorldGenerator.Create(Environment.TickCount); } catch { game = WorldGenerator.Create(Environment.TickCount); } BuildWorld(); ledger.Add("턴 " + game.turn + " — 세계가 열렸습니다."); }
         private void BuildWorld()
         {
@@ -56,7 +70,7 @@ namespace OnlyMyGame.Runtime
             foreach (var tile in game.map)
             {
                 var prefab = tile.terrain == "강" ? presentation?.waterTile : presentation?.grassTile;
-                var go = prefab == null ? GameObject.CreatePrimitive(PrimitiveType.Cylinder) : Instantiate(prefab); go.name = "Hex_" + tile.position; go.transform.position = HexToWorld(tile.position); go.transform.localScale = prefab == null ? new Vector3(.92f, .08f, .92f) : Vector3.one * .82f;
+                var go = Spawn(prefab, PrimitiveType.Cylinder); go.name = "Hex_" + tile.position; go.transform.position = HexToWorld(tile.position); go.transform.localScale = prefab == null ? new Vector3(.92f, .08f, .92f) : Vector3.one * .82f;
                 var tint = tile.terrain == "강" ? new Color(.35f, .65f, 1f) : tile.terrain == "숲" ? new Color(.38f, .72f, .36f) : tile.terrain == "언덕" ? new Color(.76f, .58f, .32f) : new Color(.64f, .86f, .45f); Tint(go, tint); visuals[tile.position] = go;
             }
             if (Camera.main == null)
@@ -68,8 +82,29 @@ namespace OnlyMyGame.Runtime
             RenderVisibility();
         }
         private Vector3 HexToWorld(HexCoord p) => new Vector3((p.q + p.r * .5f) * 1.65f, 0, p.r * 1.43f);
-        private static void Tint(GameObject visual, Color tint) { foreach (var renderer in visual.GetComponentsInChildren<Renderer>()) renderer.material.color = tint; }
-        private static GameObject Spawn(GameObject prefab, PrimitiveType fallback) => prefab == null ? GameObject.CreatePrimitive(fallback) : Instantiate(prefab);
+        private static void Tint(GameObject visual, Color tint) { foreach (var renderer in visual.GetComponentsInChildren<Renderer>()) { renderer.material.color = tint; } }
+        private static GameObject Spawn(UnityEngine.Object prefab, PrimitiveType fallback)
+        {
+            if (prefab == null) return CreatePrimitiveWithUrp(fallback);
+            var instance = Instantiate(prefab);
+            if (instance is GameObject gameObject) return gameObject;
+            if (instance is Component component) return component.gameObject;
+            Destroy(instance);
+            return CreatePrimitiveWithUrp(fallback);
+        }
+        private static GameObject CreatePrimitiveWithUrp(PrimitiveType type)
+        {
+            var go = GameObject.CreatePrimitive(type);
+            var shader = Shader.Find("Universal Render Pipeline/Lit");
+            if (shader != null)
+            {
+                foreach (var renderer in go.GetComponentsInChildren<Renderer>())
+                {
+                    renderer.material = new Material(shader);
+                }
+            }
+            return go;
+        }
         private void RenderVisibility()
         {
             foreach (var tile in game.map) if (visuals.TryGetValue(tile.position, out var go)) go.SetActive(tile.explored);
@@ -82,7 +117,7 @@ namespace OnlyMyGame.Runtime
             {
                 var prefab = unit.factionId == 1 ? presentation?.playerUnit : unit.factionId == 2 ? presentation?.skeletonUnit : presentation?.neutralUnit;
                 var marker = GameObject.Find("Unit_" + unit.id) ?? Spawn(prefab, PrimitiveType.Capsule); marker.name = "Unit_" + unit.id; marker.transform.position = HexToWorld(unit.position) + Vector3.up * .12f; marker.transform.localScale = Vector3.one * .42f; Tint(marker, unit.factionId == 1 ? new Color(.4f, .9f, 1f) : unit.factionId == 2 ? new Color(1f, .32f, .32f) : new Color(1f, .82f, .3f)); marker.SetActive(game.map.First(t => t.position.Equals(unit.position)).visible);
-                var label = GameObject.Find("UnitLabel_" + unit.id) ?? new GameObject("UnitLabel_" + unit.id); if (label.GetComponent<TextMesh>() == null) { var text = label.AddComponent<TextMesh>(); text.characterSize = .22f; text.fontSize = 48; text.anchor = TextAnchor.MiddleCenter; text.color = Color.white; }
+                var label = GameObject.Find("UnitLabel_" + unit.id) ?? new GameObject("UnitLabel_" + unit.id); if (label.GetComponent<TextMesh>() == null) { var text = label.AddComponent<TextMesh>(); text.characterSize = .22f; text.fontSize = 48; text.anchor = TextAnchor.MiddleCenter; text.color = Color.white; var font = Resources.Load<Font>("Fonts/NanumGothic-Regular"); if (font == null) font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf"); if (font != null) text.font = font; }
                 label.GetComponent<TextMesh>().text = unit.factionId == 1 ? "★" : unit.factionId == 2 ? "☠" : "¤"; label.transform.position = marker.transform.position + Vector3.up * .62f; if (Camera.main != null) label.transform.rotation = Camera.main.transform.rotation; label.SetActive(marker.activeSelf);
             }
         }
@@ -122,7 +157,7 @@ namespace OnlyMyGame.Runtime
         private void ResolveAi() { foreach (var unit in game.entities.Where(x => x.factionId == 2 && x.alive)) { var player = game.entities.First(x => x.id == 1); if (unit.position.Distance(player.position) <= 2) { player.hp--; ledger.Add("스켈레톤이 덜컹거리며 공격했습니다!"); } else unit.position = HexCoord.Directions.OrderBy(d => (new HexCoord(unit.position.q + d.q, unit.position.r + d.r)).Distance(player.position)).Select(d => new HexCoord(unit.position.q + d.q, unit.position.r + d.r)).First(p => game.map.Any(t => t.position.Equals(p))); } }
         private IEnumerator RequestRules()
         {
-            if (string.IsNullOrWhiteSpace(apiBase)) { ledger.Add("AI 서비스 주소가 설정되지 않아 다음 규칙 응답을 기다립니다. 저장 후 재시도할 수 있습니다."); yield break; }
+            if (!IsUsableApiBase(apiBase)) { ledger.Add("AI 서비스 주소가 설정되지 않았습니다. OnlyMyGameConfig.json의 apiBaseUrl을 NAS HTTPS 주소로 바꾼 뒤 재시도하세요."); yield break; }
             var request = new UnityWebRequest(apiBase.TrimEnd('/') + "/v1/rules/generate", "POST"); request.uploadHandler = new UploadHandlerRaw(System.Text.Encoding.UTF8.GetBytes(JsonUtility.ToJson(game))); request.downloadHandler = new DownloadHandlerBuffer(); request.SetRequestHeader("Content-Type", "application/json"); request.SetRequestHeader("Idempotency-Key", game.runId + "-" + game.turn); request.timeout = 20; yield return request.SendWebRequest();
             if (request.result != UnityWebRequest.Result.Success) { ledger.Add("AI 규칙 생성 실패: " + request.error + " — 재시도 또는 저장 후 나가기."); yield break; }
             var set = JsonUtility.FromJson<RuleSetV1>(request.downloadHandler.text); var validation = RuleValidator.Validate(set, game);
@@ -131,6 +166,7 @@ namespace OnlyMyGame.Runtime
             foreach (var action in set.actions ?? new List<DynamicActionV1>()) game.dynamicActions.Add(action);
             foreach (var contract in set.victoryContracts ?? new List<VictoryContractV1>()) { contract.announcedTurn = game.turn; contract.achievableFromTurn = Math.Max(contract.achievableFromTurn, game.turn + 1); game.victoryContracts.Add(contract); ledger.Add("새 승리 계약 예고: " + contract.title + " — " + contract.description); }
         }
+        private static bool IsUsableApiBase(string value) => Uri.TryCreate(value, UriKind.Absolute, out var uri) && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps) && !uri.Host.EndsWith(".example", StringComparison.OrdinalIgnoreCase);
         private GameSnapshotV1 ReadSave(string key) { var raw = PlayerPrefs.GetString(key, ""); if (string.IsNullOrEmpty(raw)) return null; var envelope = JsonUtility.FromJson<SaveEnvelope>(raw); return envelope != null && envelope.schemaVersion == 1 && envelope.checksum == Hash(envelope.payload) ? JsonUtility.FromJson<GameSnapshotV1>(envelope.payload) : null; }
         private void Save() { var payload = JsonUtility.ToJson(game); var envelope = JsonUtility.ToJson(new SaveEnvelope { payload = payload, checksum = Hash(payload) }); PlayerPrefs.SetString(BackupKey, PlayerPrefs.GetString(SaveKey, "")); PlayerPrefs.SetString(SaveKey, envelope); PlayerPrefs.Save(); }
         private static string Hash(string value) { unchecked { uint hash = 2166136261; foreach (var c in value) { hash ^= c; hash *= 16777619; } return hash.ToString("X8"); } }
