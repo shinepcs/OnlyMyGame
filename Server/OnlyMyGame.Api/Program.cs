@@ -30,8 +30,20 @@ app.MapPost("/v1/rules/generate", async (HttpContext context, GameSnapshotV1 sna
     using (var check = new SqliteCommand("SELECT COUNT(*) FROM request_log WHERE day=$day AND ip_hash=$ip", db)) { check.Parameters.AddWithValue("$day", day); check.Parameters.AddWithValue("$ip", ipHash); if ((long)(await check.ExecuteScalarAsync(ct) ?? 0L) >= int.Parse(config["ONLYMYGAME_DAILY_LIMIT"] ?? "60")) return Results.StatusCode(429); }
     using (var duplicate = new SqliteCommand("SELECT error FROM request_log WHERE request_key=$key", db)) { duplicate.Parameters.AddWithValue("$key", key); if (await duplicate.ExecuteScalarAsync(ct) is string old) return Results.Conflict(new { error = "DUPLICATE_REQUEST", previous = old }); }
     var started = DateTime.UtcNow; RuleSetV1? set = null; string? error = null;
-    try { set = await GenerateRules(snapshot, clients.CreateClient("openai"), config["OPENAI_API_KEY"], ct); var validation = RuleValidator.Validate(set, snapshot); if (!validation.valid) { set = await GenerateRules(snapshot, clients.CreateClient("openai"), config["OPENAI_API_KEY"], ct, validation.diagnostics); validation = RuleValidator.Validate(set, snapshot); if (!validation.valid) set = SafeFallback(snapshot); } }
-    catch (Exception ex) { error = ex.Message; }
+    try
+    {
+        // PRD: 로컬 대체 규칙은 사용하지 않는다. 첫 실패 시 진단을 포함해 한 번만 자동 수정 재시도하고,
+        // 두 번째도 실패하면 503을 반환해 클라이언트가 게임을 차단하고 재시도/저장 후 나가기를 제공하게 한다.
+        set = await GenerateRules(snapshot, clients.CreateClient("openai"), config["OPENAI_API_KEY"], ct);
+        var validation = RuleValidator.Validate(set, snapshot);
+        if (!validation.valid)
+        {
+            set = await GenerateRules(snapshot, clients.CreateClient("openai"), config["OPENAI_API_KEY"], ct, validation.diagnostics);
+            validation = RuleValidator.Validate(set, snapshot);
+            if (!validation.valid) { set = null; error = "VALIDATION_FAILED_AFTER_RETRY"; }
+        }
+    }
+    catch (Exception ex) { set = null; error = ex.Message; }
     using (var insert = new SqliteCommand("INSERT INTO request_log(day,ip_hash,request_key,created_utc,latency_ms,valid,error) VALUES($day,$ip,$key,$utc,$latency,$valid,$error)", db)) { insert.Parameters.AddWithValue("$day", day); insert.Parameters.AddWithValue("$ip", ipHash); insert.Parameters.AddWithValue("$key", key); insert.Parameters.AddWithValue("$utc", DateTime.UtcNow.ToString("O")); insert.Parameters.AddWithValue("$latency", (int)(DateTime.UtcNow - started).TotalMilliseconds); insert.Parameters.AddWithValue("$valid", set != null && error == null ? 1 : 0); insert.Parameters.AddWithValue("$error", error ?? ""); await insert.ExecuteNonQueryAsync(ct); }
     return error == null ? Results.Ok(set) : Results.StatusCode(503);
 });
@@ -50,4 +62,3 @@ static async Task<RuleSetV1> GenerateRules(GameSnapshotV1 snapshot, HttpClient c
     return JsonSerializer.Deserialize<RuleSetV1>(json!, jsonOptions) ?? throw new InvalidOperationException("EMPTY_RULESET");
 }
 
-static RuleSetV1 SafeFallback(GameSnapshotV1 snapshot) => new RuleSetV1 { requestId = snapshot.runId, applyTurn = snapshot.turn + 1, koreanSummary = "AI 규칙 형식을 안전한 기본 규칙으로 보정했습니다.", changes = new List<RuleNodeV1> { new RuleNodeV1 { id = "safe-supply-" + snapshot.turn, name = "보급 바람", description = "턴 종료 시 식량 1을 얻습니다.", trigger = EventType.TurnEnd, condition = new ConditionNode { op = CompareOp.Always }, effects = new List<EffectNode> { new EffectNode { type = EffectType.Resource, resource = ResourceType.Food, amount = 1 } }, durationTurns = 3, appliedTurn = snapshot.turn + 1 } } };

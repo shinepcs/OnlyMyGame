@@ -34,15 +34,17 @@ namespace OnlyMyGame.Runtime
         }
         public static void Reveal(GameSnapshotV1 game)
         {
-            var player = game.entities.First(x => x.factionId == 1 && x.alive);
-            foreach (var tile in game.map) { tile.visible = tile.position.Distance(player.position) <= 2; tile.explored |= tile.visible; }
+            var player = game.entities.FirstOrDefault(x => x.factionId == 1 && x.alive);
+            if (player == null) return; // 플레이어 유닛이 없으면 시야 갱신 없음
+            var range = GameRules.VisibilityRange(game, 1);
+            foreach (var tile in game.map) { tile.visible = tile.position.Distance(player.position) <= range; tile.explored |= tile.visible; }
         }
     }
 
     public sealed class GameController : MonoBehaviour
     {
-        private GameSnapshotV1 game; private readonly RuleVm vm = new RuleVm(); private readonly List<string> ledger = new List<string>(); private readonly List<CommandType> commands = new List<CommandType>();
-        private Dictionary<HexCoord, GameObject> visuals = new Dictionary<HexCoord, GameObject>(); private bool waitingForRules; private string apiBase; private GUIStyle header, body, button; private GamePresentationCatalog presentation;
+        private GameSnapshotV1 game; private readonly RuleVm vm = new RuleVm(); private readonly List<string> ledger = new List<string>(); private readonly List<PlannedCommand> commands = new List<PlannedCommand>();
+        private Dictionary<HexCoord, GameObject> visuals = new Dictionary<HexCoord, GameObject>(); private bool waitingForRules; private bool blockedOnRules; private string blockReason = ""; private string apiBase; private GUIStyle header, body, button; private GamePresentationCatalog presentation;
         [Serializable] private sealed class SaveEnvelope { public int schemaVersion = 1; public string payload; public string checksum; }
         [Serializable] private sealed class ClientConfig { public string apiBaseUrl; }
         private const string SaveKey = "onlymygame.autosave.v1"; private const string BackupKey = "onlymygame.autosave.v1.backup";
@@ -107,6 +109,21 @@ namespace OnlyMyGame.Runtime
         }
         private void RenderVisibility()
         {
+            // 행운에 따른 월드 조명 표현 (행운이 높을수록 따뜻하고 밝게)
+            if (Camera.main != null)
+            {
+                var sun = GameObject.Find("World Sun");
+                if (sun != null)
+                {
+                    var light = sun.GetComponent<Light>();
+                    if (light != null)
+                    {
+                        var luckFactor = game.luck / 100f;
+                        light.intensity = 1.1f + luckFactor * 0.6f;
+                        light.color = Color.Lerp(new Color(.7f, .75f, .9f), new Color(1f, .91f, .73f), luckFactor);
+                    }
+                }
+            }
             foreach (var tile in game.map) if (visuals.TryGetValue(tile.position, out var go)) go.SetActive(tile.explored);
             foreach (var building in game.buildings)
             {
@@ -120,11 +137,78 @@ namespace OnlyMyGame.Runtime
                 var label = GameObject.Find("UnitLabel_" + unit.id) ?? new GameObject("UnitLabel_" + unit.id); if (label.GetComponent<TextMesh>() == null) { var text = label.AddComponent<TextMesh>(); text.characterSize = .22f; text.fontSize = 48; text.anchor = TextAnchor.MiddleCenter; text.color = Color.white; var font = Resources.Load<Font>("Fonts/NanumGothic-Regular"); if (font == null) font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf"); if (font != null) text.font = font; }
                 label.GetComponent<TextMesh>().text = unit.factionId == 1 ? "★" : unit.factionId == 2 ? "☠" : "¤"; label.transform.position = marker.transform.position + Vector3.up * .62f; if (Camera.main != null) label.transform.rotation = Camera.main.transform.rotation; label.SetActive(marker.activeSelf);
             }
+            RenderRuleCues();
+        }
+        // 5단계: 새 규칙을 영향받는 타일·유닛·거점에 표지판으로 표현한다.
+        private void RenderRuleCues()
+        {
+            // 기존 표지판 제거
+            foreach (var old in GameObject.FindGameObjectsWithTag("RuleCue")) Destroy(old);
+            var active = game.activeRules.Where(r => game.turn <= r.appliedTurn + r.durationTurns).ToList();
+            if (active.Count == 0) return;
+            var playerUnit = game.entities.FirstOrDefault(u => u.factionId == 1 && u.alive);
+            if (playerUnit == null) return;
+            var cuePos = playerUnit.position;
+            for (var i = 0; i < Math.Min(active.Count, 3); i++)
+            {
+                var rule = active[i];
+                var cue = new GameObject("RuleCue_" + i);
+                cue.tag = "RuleCue";
+                var text = cue.AddComponent<TextMesh>();
+                text.characterSize = .18f; text.fontSize = 40; text.anchor = TextAnchor.MiddleCenter; text.color = new Color(1f, .9f, .3f);
+                var font = Resources.Load<Font>("Fonts/NanumGothic-Regular");
+                if (font == null) font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+                if (font != null) text.font = font;
+                text.text = "◆ " + rule.name;
+                var offset = new HexCoord(playerUnit.position.q + (i + 1), playerUnit.position.r - (i + 1));
+                cue.transform.position = HexToWorld(offset) + Vector3.up * .5f;
+                if (Camera.main != null) cue.transform.rotation = Camera.main.transform.rotation;
+            }
         }
         private int Cost(CommandType type) => type == CommandType.Move ? 1 : type == CommandType.Build || type == CommandType.Upgrade ? 3 : 2;
-        private void Queue(CommandType command) { var player = game.factions.First(f => f.id == 1); if (!waitingForRules && commands.Sum(Cost) + Cost(command) <= player.sp) { commands.Add(command); ledger.Add(CommandKorean(command) + " 명령을 예약했습니다. 예상 SP " + (player.sp - commands.Sum(Cost))); } }
+        private void Queue(CommandType command)
+        {
+            var player = game.factions.First(f => f.id == 1);
+            if (waitingForRules || commands.Sum(c => Cost(c.type)) + Cost(command) > player.sp) return;
+            var unit = game.entities.First(x => x.factionId == 1 && x.alive);
+            var planned = new PlannedCommand { factionId = 1, unitId = unit.id, type = command, target = unit.position };
+            if (command == CommandType.Move) planned.target = new HexCoord(unit.position.q + 1, unit.position.r);
+            commands.Add(planned);
+            ledger.Add(CommandKorean(command) + " 명령을 예약했습니다. 예상 SP " + (player.sp - commands.Sum(c => Cost(c.type))) + " / 예상 결과: " + ExpectedRange(command));
+        }
+        private string ExpectedRange(CommandType c)
+        {
+            if (c == CommandType.Attack) return "피해 2~3, 행운 70 이상이면 3";
+            if (c == CommandType.Hunt) return "식량 2, 행운 60 이상이면 4";
+            if (c == CommandType.Trade) return "식량 1 → 화폐 2, 관계 +4";
+            if (c == CommandType.Hire) return "화폐 3 → 고용병 1";
+            if (c == CommandType.Build) return "목재 3~5 → 건물 1채";
+            if (c == CommandType.Upgrade) return "석재 3 → 건물 레벨 +1";
+            return "";
+        }
         private string CommandKorean(CommandType c) => c == CommandType.Move ? "이동" : c == CommandType.Gather ? "채집" : c == CommandType.Hunt ? "수렵" : c == CommandType.Attack ? "공격" : c == CommandType.Trade ? "거래" : c == CommandType.Hire ? "고용" : c == CommandType.Build ? "건설" : c == CommandType.Upgrade ? "강화" : "설득";
-        private void EndTurn() { if (!waitingForRules) StartCoroutine(ResolveTurn()); }
+        private void EndTurn()
+        {
+            if (blockedOnRules) return;
+            if (!waitingForRules) StartCoroutine(ResolveTurn());
+        }
+        private void RetryRules()
+        {
+            if (blockedOnRules && IsUsableApiBase(apiBase))
+            {
+                blockedOnRules = false;
+                StartCoroutine(RequestRules());
+            }
+        }
+        private void SaveAndQuit()
+        {
+            if (!blockedOnRules) return;
+            Save();
+            Application.Quit();
+#if UNITY_EDITOR
+            UnityEditor.EditorApplication.isPlaying = false;
+#endif
+        }
         private void RunDynamic(DynamicActionV1 action)
         {
             var player = game.factions.First(f => f.id == 1);
@@ -134,37 +218,47 @@ namespace OnlyMyGame.Runtime
         }
         private IEnumerator ResolveTurn()
         {
-            waitingForRules = true; GameRules.StartTurn(game); var player = game.factions.First(f => f.id == 1); vm.Execute(OnlyMyGame.Core.EventType.TurnStart, game, ledger);
-            foreach (var command in commands) ResolveCommand(command, player); commands.Clear(); ResolveAi(); vm.Execute(OnlyMyGame.Core.EventType.TurnEnd, game, ledger);
+            waitingForRules = true;
+            // PRD 고정 해결 순서: 턴 시작 → 이동·충돌 → 거래·외교 → 전투 → 채집·건설 → 지속 효과 → 승패 판정
+            var random = new DeterministicRandom(game.seed + game.turn * 7919);
+            TurnResolver.Resolve(game, commands, random, ledger);
+            commands.Clear();
             if (!GameRules.HeadquartersAlive(game) && !game.entities.Any(u => u.factionId == 1 && u.alive)) { ledger.Add("본부와 복구 가능한 아군이 모두 사라져 원정이 끝났습니다."); Save(); waitingForRules = false; yield break; }
             game.turn++; game.luck = new DeterministicRandom(game.seed + game.turn * 7919).Next(1, 101); WorldGenerator.Reveal(game); RenderVisibility();
             foreach (var contract in game.victoryContracts.Where(c => GameRules.IsVictoryComplete(game, c))) ledger.Add("승리 계약 달성: " + contract.title);
             yield return StartCoroutine(RequestRules()); Save(); waitingForRules = false;
         }
-        private void ResolveCommand(CommandType c, FactionState p)
-        {
-            p.sp -= Cost(c); GameRules.CountAction(game, c); var unit = game.entities.First(x => x.factionId == 1 && x.alive);
-            if (c == CommandType.Move) { var to = new HexCoord(unit.position.q + 1, unit.position.r); if (game.map.Any(t => t.position.Equals(to) && t.terrain != "강")) unit.position = to; ledger.Add("원정대가 새 타일로 이동했습니다."); }
-            else if (c == CommandType.Gather) { var tile = game.map.First(t => t.position.Equals(unit.position)); if (tile.amount > 0) { tile.amount--; p.resources.Add(tile.resource, 2); ledger.Add(tile.resource + " 2을 채집했습니다."); } }
-            else if (c == CommandType.Hunt) { p.resources.Add(ResourceType.Food, game.luck > 60 ? 4 : 2); ledger.Add("수렵으로 식량을 확보했습니다."); }
-            else if (c == CommandType.Attack) { var target = game.entities.FirstOrDefault(x => x.factionId != 1 && x.alive && x.position.Distance(unit.position) <= 2); if (target != null) { target.hp -= game.luck > 70 ? 3 : 2; if (target.hp <= 0) { target.alive = false; GameRules.CountAction(game, CommandType.Attack); ledger.Add("코믹한 일격! 적 유닛을 처치했습니다."); } else ledger.Add("적을 공격했습니다."); } else ledger.Add("사거리 안에 적이 없습니다."); }
-            else if (c == CommandType.Trade) { if (p.resources.Spend(ResourceType.Food, 1)) { p.resources.Add(ResourceType.Coin, 2); game.factions.First(f => f.id == 3).relationToPlayer += 4; ledger.Add("장터단과 거래했습니다."); } }
-            else if (c == CommandType.Hire) { if (p.resources.Spend(ResourceType.Coin, 3)) { game.entities.Add(new UnitState { id = 100 + game.entities.Count, factionId = 1, position = unit.position, tags = new List<string> { "고용병" } }); ledger.Add("고용병이 원정대에 합류했습니다."); } }
-            else if (c == CommandType.Build) { var built = game.buildings.Where(b => b.factionId == 1).Select(b => b.type).ToList(); var type = !built.Contains(BuildingType.Warehouse) ? BuildingType.Warehouse : !built.Contains(BuildingType.Workshop) ? BuildingType.Workshop : !built.Contains(BuildingType.Watchtower) ? BuildingType.Watchtower : !built.Contains(BuildingType.Market) ? BuildingType.Market : BuildingType.Barracks; if (p.resources.Spend(ResourceType.Wood, GameRules.BuildingCost(type))) { game.buildings.Add(new BuildingState { id = 100 + game.buildings.Count, factionId = 1, position = unit.position, type = type }); ledger.Add(type + "을 건설했습니다."); } }
-            else if (c == CommandType.Upgrade) { var building = game.buildings.LastOrDefault(b => b.factionId == 1); if (building != null && p.resources.Spend(ResourceType.Stone, 3)) { building.level++; ledger.Add(building.type + "을 " + building.level + "단계로 강화했습니다."); } }
-            else { game.factions.Where(f => f.id != 1).ToList().ForEach(f => f.relationToPlayer += 3); ledger.Add("상대 세력에 설득을 시도했습니다."); }
-        }
-        private void ResolveAi() { foreach (var unit in game.entities.Where(x => x.factionId == 2 && x.alive)) { var player = game.entities.First(x => x.id == 1); if (unit.position.Distance(player.position) <= 2) { player.hp--; ledger.Add("스켈레톤이 덜컹거리며 공격했습니다!"); } else unit.position = HexCoord.Directions.OrderBy(d => (new HexCoord(unit.position.q + d.q, unit.position.r + d.r)).Distance(player.position)).Select(d => new HexCoord(unit.position.q + d.q, unit.position.r + d.r)).First(p => game.map.Any(t => t.position.Equals(p))); } }
         private IEnumerator RequestRules()
         {
-            if (!IsUsableApiBase(apiBase)) { ledger.Add("AI 서비스 주소가 설정되지 않았습니다. OnlyMyGameConfig.json의 apiBaseUrl을 NAS HTTPS 주소로 바꾼 뒤 재시도하세요."); yield break; }
+            waitingForRules = true;
+            if (!IsUsableApiBase(apiBase))
+            {
+                ledger.Add("AI 서비스 주소가 설정되지 않았습니다. OnlyMyGameConfig.json의 apiBaseUrl을 NAS HTTPS 주소로 바꾼 뒤 재시도하세요.");
+                BlockOnRules("AI 서비스 주소가 설정되지 않았습니다.");
+                yield break;
+            }
             var request = new UnityWebRequest(apiBase.TrimEnd('/') + "/v1/rules/generate", "POST"); request.uploadHandler = new UploadHandlerRaw(System.Text.Encoding.UTF8.GetBytes(JsonUtility.ToJson(game))); request.downloadHandler = new DownloadHandlerBuffer(); request.SetRequestHeader("Content-Type", "application/json"); request.SetRequestHeader("Idempotency-Key", game.runId + "-" + game.turn); request.timeout = 20; yield return request.SendWebRequest();
-            if (request.result != UnityWebRequest.Result.Success) { ledger.Add("AI 규칙 생성 실패: " + request.error + " — 재시도 또는 저장 후 나가기."); yield break; }
+            if (request.result != UnityWebRequest.Result.Success)
+            {
+                ledger.Add("AI 규칙 생성 실패: " + request.error);
+                BlockOnRules("AI 규칙 생성에 실패했습니다: " + request.error);
+                yield break;
+            }
             var set = JsonUtility.FromJson<RuleSetV1>(request.downloadHandler.text); var validation = RuleValidator.Validate(set, game);
-            if (!validation.valid) { ledger.Add("AI 응답이 안전성 검증을 통과하지 못했습니다: " + string.Join(", ", validation.errors)); yield break; }
+            if (!validation.valid)
+            {
+                ledger.Add("AI 응답이 안전성 검증을 통과하지 못했습니다: " + string.Join(", ", validation.errors));
+                BlockOnRules("AI 응답이 안전성 검증을 통과하지 못했습니다.");
+                yield break;
+            }
+            blockedOnRules = false; blockReason = "";
             foreach (var rule in set.changes) { rule.appliedTurn = game.turn + 1; game.activeRules.Add(rule); ledger.Add("새 규칙 예고: " + rule.name + " — " + rule.description); }
             foreach (var action in set.actions ?? new List<DynamicActionV1>()) game.dynamicActions.Add(action);
             foreach (var contract in set.victoryContracts ?? new List<VictoryContractV1>()) { contract.announcedTurn = game.turn; contract.achievableFromTurn = Math.Max(contract.achievableFromTurn, game.turn + 1); game.victoryContracts.Add(contract); ledger.Add("새 승리 계약 예고: " + contract.title + " — " + contract.description); }
+        }
+        private void BlockOnRules(string reason)
+        {
+            blockedOnRules = true; blockReason = reason;
         }
         private static bool IsUsableApiBase(string value) => Uri.TryCreate(value, UriKind.Absolute, out var uri) && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps) && !uri.Host.EndsWith(".example", StringComparison.OrdinalIgnoreCase);
         private GameSnapshotV1 ReadSave(string key) { var raw = PlayerPrefs.GetString(key, ""); if (string.IsNullOrEmpty(raw)) return null; var envelope = JsonUtility.FromJson<SaveEnvelope>(raw); return envelope != null && envelope.schemaVersion == 1 && envelope.checksum == Hash(envelope.payload) ? JsonUtility.FromJson<GameSnapshotV1>(envelope.payload) : null; }
@@ -179,9 +273,25 @@ namespace OnlyMyGame.Runtime
             var x = 28; foreach (var command in new[] { CommandType.Move, CommandType.Gather, CommandType.Hunt, CommandType.Attack, CommandType.Trade, CommandType.Hire }) { if (GUI.Button(new Rect(x, 125, 64, 30), CommandKorean(command), button)) Queue(command); x += 69; }
             x = 28; foreach (var command in new[] { CommandType.Build, CommandType.Upgrade, CommandType.Persuade }) { if (GUI.Button(new Rect(x, 158, 72, 28), CommandKorean(command), button)) Queue(command); x += 77; }
             x = 270; foreach (var action in game.dynamicActions.Take(2)) { if (GUI.Button(new Rect(x, 158, 88, 28), action.name, button)) RunDynamic(action); x += 92; }
+            if (blockedOnRules)
+            {
+                GUI.Box(new Rect(Screen.width / 2 - 180, Screen.height / 2 - 80, 360, 160), "");
+                GUI.Label(new Rect(Screen.width / 2 - 160, Screen.height / 2 - 64, 320, 64), "AI 규칙 생성 차단됨\n" + blockReason, body);
+                if (GUI.Button(new Rect(Screen.width / 2 - 160, Screen.height / 2 + 10, 140, 30), "재시도", button)) RetryRules();
+                if (GUI.Button(new Rect(Screen.width / 2 + 20, Screen.height / 2 + 10, 140, 30), "저장 후 나가기", button)) SaveAndQuit();
+                return;
+            }
             if (GUI.Button(new Rect(28, 192, 160, 34), waitingForRules ? "AI 규칙 생성 중…" : "명령 확정 · 턴 종료", button)) EndTurn();
+            // 5단계: 규칙 장부 — 발생 원인 → 새 조건 → 효과 → 지속 시간 → 승리 조건 영향
             GUI.Label(new Rect(28, 238, 410, 24), "규칙 장부 (원인 → 조건 → 효과 → 지속 → 목표 영향)", header);
-            var entries = ledger.Skip(Math.Max(0, ledger.Count - 10)).ToList(); GUI.Label(new Rect(28, 272, 410, Screen.height - 290), string.Join("\n\n", entries), body);
+            var ruleBook = new List<string>();
+            foreach (var rule in game.activeRules.Where(r => game.turn <= r.appliedTurn + r.durationTurns).Take(4))
+            {
+                var remaining = rule.appliedTurn + rule.durationTurns - game.turn;
+                ruleBook.Add("[" + rule.name + "] 원인: " + rule.trigger + " → 조건: " + (rule.condition?.op ?? CompareOp.Always) + " → 효과: " + string.Join(", ", rule.effects.Select(e => e.type.ToString())) + " → 지속: " + remaining + "턴 → 목표 영향: " + (game.victoryContracts.Any(v => v.progressKey == rule.id) ? "있음" : "없음"));
+            }
+            var entries = ruleBook.Concat(ledger.Skip(Math.Max(0, ledger.Count - 6))).ToList();
+            GUI.Label(new Rect(28, 272, 410, Screen.height - 290), string.Join("\n\n", entries), body);
         }
     }
 }
