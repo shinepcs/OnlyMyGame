@@ -2,7 +2,8 @@
   "name": "OnlyMyGame.Editor",
   "rootNamespace": "OnlyMyGame",
   "references": [
-    "OnlyMyGame.Runtime"
+    "OnlyMyGame.Runtime",
+    "Unity.TextMeshPro"
   ],
   "includePlatforms": [
     "Editor"

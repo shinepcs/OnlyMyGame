@@ -1,5 +1,6 @@
 using System.IO;
 using OnlyMyGame.Runtime;
+using TMPro;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
@@ -274,20 +275,48 @@ namespace OnlyMyGame.EditorTools
             Debug.Log("[OnlyMyGame] 리소스 쇼케이스 씬 생성 완료: " + ShowcaseScenePath);
         }
 
+        private const string TmpFontPath = "Assets/OnlyMyGame/Resources/Fonts/NanumGothic-Regular SDF.asset";
+
         private static GameObject CreateTextObject(string text, Vector3 position, float characterSize, Color color)
         {
             var go = new GameObject("Label_" + text);
             go.transform.position = position;
-            var tm = go.AddComponent<TextMesh>();
-            tm.text = text;
-            tm.characterSize = characterSize;
-            tm.fontSize = 48;
-            tm.anchor = TextAnchor.MiddleCenter;
-            tm.color = color;
-            var font = AssetDatabase.LoadAssetAtPath<Font>("Assets/OnlyMyGame/Resources/Fonts/NanumGothic-Regular.ttf");
-            if (font == null) font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
-            if (font != null) tm.font = font;
+
+            var tmp = go.AddComponent<TextMeshPro>();
+            tmp.text = text;
+            // 레거시 TextMesh(characterSize=0.22/0.35, fontSize=48)의 실제 렌더 높이 ≈ characterSize × 48 / 10.
+            // TMP의 fontSize는 월드 단위 높이를 직접 제어하므로 동일한 시각적 크기로 환산한다.
+            tmp.fontSize = characterSize * 4.8f;
+            tmp.alignment = TextAlignmentOptions.Center;
+            tmp.color = color;
+
+            var font = LoadOrCreateTmpFont();
+            if (font != null) tmp.font = font;
+
             return go;
+        }
+
+        /// <summary>
+        /// NanumGothic으로 만든 TMP SDF 폰트 에셋을 반환한다.
+        /// 아직 없으면 TTF에서 생성해 저장하고, 생성할 수 없으면 기본 TMP 폰트로 폴백한다.
+        /// </summary>
+        private static TMP_FontAsset LoadOrCreateTmpFont()
+        {
+            var existing = AssetDatabase.LoadAssetAtPath<TMP_FontAsset>(TmpFontPath);
+            if (existing != null) return existing;
+
+            var ttf = AssetDatabase.LoadAssetAtPath<Font>("Assets/OnlyMyGame/Resources/Fonts/NanumGothic-Regular.ttf");
+            var fallback = TMP_Settings.instance != null ? TMP_Settings.defaultFontAsset : null;
+            if (ttf == null) return fallback;
+
+            // 명시적 파라미터로 생성: TMP Settings가 초기화되지 않은 배치모드에서도 동작한다.
+            var created = TMP_FontAsset.CreateFontAsset(ttf, 90, 9, UnityEngine.TextCore.LowLevel.GlyphRenderMode.SDFAA, 1024, 1024, AtlasPopulationMode.Dynamic);
+            if (created == null) return fallback;
+
+            AssetDatabase.CreateAsset(created, TmpFontPath);
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+            return created;
         }
 
         private static Object BuildPrefab(string fbxPath, string name, float scale)
