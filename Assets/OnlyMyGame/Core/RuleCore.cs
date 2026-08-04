@@ -4,7 +4,7 @@ using System.Linq;
 
 namespace OnlyMyGame.Core
 {
-    public enum ResourceType { Food, Wood, Stone, Iron, Coin }
+    public enum ResourceType { None, Food, Wood, Stone, Iron, Coin }
     public enum FactionKind { Player, Skeleton, Neutral }
     public enum BuildingType { Headquarters, Warehouse, Workshop, Watchtower, Market, Barracks }
     public enum EventType { TurnStart, TurnEnd, Move, Attack, Kill, Gather, Build, Trade, RelationChanged, TileEntered }

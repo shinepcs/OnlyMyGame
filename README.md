@@ -10,6 +10,31 @@ Unity 6000.5.6f1 WebGL용, 매 턴 AI 규칙이 바뀌는 1인 SRPG 버티컬 �
 
 API 키는 Unity 프로젝트·WebGL 산출물·Git에 포함하지 않습니다. `GET /health`가 설정 상태를 알려주며, 키가 없거나 AI 응답이 20초 안에 도착하지 않으면 게임은 마지막 해결 턴을 저장하고 재시도 메시지를 표시합니다.
 
+## 리소스 편집 (KayKit 프리팹 & 쇼케이스 씬)
+
+게임은 `Assets/KayKit`의 FBX 에셋을 프리팹으로 변환해 사용합니다. 아직 프리팹이 생성되지 않았다면 게임이 임시 Primitive로 실행되므로, 아래 순서로 리소스를 먼저 빌드하세요.
+
+### 1. 프리팹 + 카탈로그 생성
+
+Unity 메뉴에서 **OnlyMyGame → Build KayKit Prefabs**를 실행합니다.
+
+- `Assets/OnlyMyGame/Resources/KayKit/*.prefab` — FBX → 프리팹 변환 (유닛 0.5배, 나머지 1.0배 스케일)
+- `Assets/OnlyMyGame/Resources/OnlyMyGamePresentation.asset` — 게임이 참조하는 프레젠테이션 카탈로그
+
+### 2. 리소스 쇼케이스 씬 열기
+
+Unity 메뉴에서 **OnlyMyGame → Open Resource Showcase Scene**을 실행하면
+`Assets/Scenes/OnlyMyGame_ResourceShowcase.unity`가 생성되고 열립니다.
+
+- 지형 타일, 유닛, 건물, 장식, 자원, 깃발, 소품을 섹션별 그리드로 배치
+- 각 항목에 필드명 라벨이 표시되어 어떤 프리셋이 어떤 모습인지 한눈에 확인
+- 프리셋의 스케일/회전을 조정하고 싶다면 해당 프리셋을 직접 수정하면 게임에 반영됩니다
+
+### 3. 게임 실행
+
+`Assets/Scenes/OnlyMyGame.unity`를 열어 플레이하면 카탈로그에 등록된 KayKit 프리셋이
+지형·유닛·건물·자원·장식에 자동 적용됩니다. 카탈로그에 없는 항목만 Primitive 폴백으로 표시됩니다.
+
 ## NAS API 자동 배포
 
 Codex 작업이 끝날 때마다 프로젝트의 `Stop` 훅이 실행됩니다. API 이미지에 포함되는 파일(`Server/OnlyMyGame.Api`, `RuleCore.cs`, Docker Compose)의 해시가 마지막 성공 배포와 다를 때만, 현재 Mac의 변경 파일을 NAS로 직접 전송하고 `onlymygame-api` 컨테이너를 다시 빌드·시작합니다. Git commit·push나 GitHub Actions는 필요하지 않습니다. 변경이 없으면 아무 작업도 하지 않습니다.

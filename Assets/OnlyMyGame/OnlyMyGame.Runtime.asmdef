@@ -1,7 +1,9 @@
 {
   "name": "OnlyMyGame.Runtime",
   "rootNamespace": "OnlyMyGame",
-  "references": [],
+  "references": [
+    "Unity.ugui"
+  ],
   "includePlatforms": [],
   "excludePlatforms": [],
   "allowUnsafeCode": false,
