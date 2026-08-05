@@ -197,8 +197,10 @@ namespace OnlyMyGame.Tests
             Assert.IsFalse(headquarters.interactable, "살아있는 본부가 이미 있으면 두 번째 본부를 예약할 수 없어야 합니다.");
             Assert.IsTrue(workshop.interactable, "초기 목재 8·철 2로 작업장을 예약할 수 있어야 합니다.");
             Assert.IsFalse(barracks.interactable, "초기 철 2로 철 3이 필요한 병영을 예약할 수 없어야 합니다.");
-            StringAssert.Contains("목재 5", workshop.GetComponentInChildren<Text>(true).text);
-            StringAssert.Contains("철 2", workshop.GetComponentInChildren<Text>(true).text);
+            var workshopLabel = workshop.GetComponentInChildren<TextMeshProUGUI>(true);
+            Assert.IsNotNull(workshopLabel, "작업장 버튼은 TMP 라벨을 가져야 합니다.");
+            StringAssert.Contains("목재 5", workshopLabel.text);
+            StringAssert.Contains("철 2", workshopLabel.text);
 
             var cancelBuild = hud.GetComponentsInChildren<Button>(true).SingleOrDefault(button => button.name == "BuildPickerCancel");
             Assert.IsNotNull(cancelBuild);

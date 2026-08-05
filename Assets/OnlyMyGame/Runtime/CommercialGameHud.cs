@@ -130,7 +130,7 @@ namespace OnlyMyGame.Runtime
             Anchor(top, new Vector2(0, 1), new Vector2(1, 1), Vector2.zero, new Vector2(0, 82), new Vector2(0.5f, 1));
             headline = Label("Headline", top.transform, "ONLY MY GAME", 24, Gold, TextAnchor.MiddleLeft, FontStyle.Bold);
             Anchor(headline.gameObject, new Vector2(0, 0), new Vector2(0, 1), new Vector2(24, 0), new Vector2(275, 0), new Vector2(0, 0.5f));
-            luckBadge = Label("LuckBadge", top.transform, "☀  행운 --", 17, Gold, TextAnchor.MiddleCenter, FontStyle.Bold);
+            luckBadge = Label("LuckBadge", top.transform, "행운 --", 17, Gold, TextAnchor.MiddleCenter, FontStyle.Bold);
             Anchor(luckBadge.gameObject, new Vector2(0, 0), new Vector2(0, 1), new Vector2(300, 0), new Vector2(142, 0), new Vector2(0, 0.5f));
             resources = Label("Resources", top.transform, string.Empty, 19, Color.white, TextAnchor.MiddleCenter, FontStyle.Normal);
             Anchor(resources.gameObject, new Vector2(0.23f, 0), new Vector2(0.79f, 1), Vector2.zero, Vector2.zero, new Vector2(0.5f, 0.5f));
@@ -422,7 +422,7 @@ namespace OnlyMyGame.Runtime
             }
 
             headline.text = "ONLY MY GAME   ·   TURN " + game.turn;
-            luckBadge.text = "☀  행운 " + game.luck;
+            luckBadge.text = "행운 " + game.luck;
             luckBadge.color = game.luck >= 70 ? Cyan : game.luck >= 35 ? Gold : Red;
             resources.text = "[식] " + player.resources.food + "    [목] " + player.resources.wood + "    [석] " + player.resources.stone + "    [철] " + player.resources.iron + "    [금] " + player.resources.coin;
             service.text = controller.ServiceStatus;
