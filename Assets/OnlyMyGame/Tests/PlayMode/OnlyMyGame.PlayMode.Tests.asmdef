@@ -2,7 +2,8 @@
   "name": "OnlyMyGame.PlayMode.Tests",
   "rootNamespace": "OnlyMyGame.Tests",
   "references": [
-    "OnlyMyGame.Runtime"
+    "OnlyMyGame.Runtime",
+    "Unity.TextMeshPro"
   ],
   "includePlatforms": [],
   "excludePlatforms": [],

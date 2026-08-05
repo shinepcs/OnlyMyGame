@@ -7,6 +7,7 @@ using Newtonsoft.Json;
 using NUnit.Framework;
 using OnlyMyGame.Core;
 using OnlyMyGame.Runtime;
+using TMPro;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using UnityEngine.TestTools;
@@ -159,7 +160,7 @@ namespace OnlyMyGame.Tests
             var luckFeedback = luckWorld.GetComponent<LuckWorldFeedback>();
             Assert.IsNotNull(luckFeedback, "행운 표지는 턴 변화 연출 컴포넌트를 가져야 합니다.");
             Assert.AreEqual(controller.Game.luck, luckFeedback.CurrentLuck);
-            var luckBadge = hud.GetComponentsInChildren<Text>(true).SingleOrDefault(text => text.name == "LuckBadge");
+            var luckBadge = hud.GetComponentsInChildren<TextMeshProUGUI>(true).SingleOrDefault(text => text.name == "LuckBadge");
             Assert.IsNotNull(luckBadge, "상단 HUD에 전용 행운 배지가 있어야 합니다.");
             StringAssert.Contains(controller.Game.luck.ToString(), luckBadge.text);
 
