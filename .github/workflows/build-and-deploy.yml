@@ -448,7 +448,7 @@ jobs:
             log_file="$PWD/artifacts/unity/logs/$slug.log"
 
             set +e
-            "$UNITY_PATH" -batchmode -nographics -quit \
+            "$UNITY_PATH" -batchmode -nographics \
               -projectPath "$GITHUB_WORKSPACE" \
               -runTests -testPlatform "$mode" \
               -testResults "$result_file" \
@@ -462,6 +462,7 @@ jobs:
               exit "$exit_code"
             fi
             if [ ! -s "$result_file" ]; then
+              [ -f "$log_file" ] && tail -n 160 "$log_file"
               echo "$mode result XML was not created."
               exit 1
             fi

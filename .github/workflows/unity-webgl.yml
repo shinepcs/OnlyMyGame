@@ -78,13 +78,16 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $resultPath = Join-Path $env:GITHUB_WORKSPACE 'artifacts\unity\test-results\editmode.xml'
           $logPath = Join-Path $env:GITHUB_WORKSPACE 'artifacts\unity\logs\editmode.log'
-          & $env:UNITY_PATH -batchmode -nographics -quit -projectPath $env:GITHUB_WORKSPACE -runTests -testPlatform EditMode -testResults $resultPath -logFile $logPath
+          & $env:UNITY_PATH -batchmode -nographics -projectPath $env:GITHUB_WORKSPACE -runTests -testPlatform EditMode -testResults $resultPath -logFile $logPath
           $exitCode = $LASTEXITCODE
           if ($exitCode -ne 0) {
             if (Test-Path $logPath) { Get-Content $logPath | Select-Object -Last 160 }
             throw "EditMode tests failed with exit code $exitCode."
           }
-          if (-not (Test-Path $resultPath)) { throw 'EditMode result XML was not created.' }
+          if (-not (Test-Path $resultPath) -or (Get-Item $resultPath).Length -eq 0) {
+            if (Test-Path $logPath) { Get-Content $logPath | Select-Object -Last 160 }
+            throw 'EditMode result XML was not created.'
+          }
 
       - name: PlayMode tests
         shell: powershell -ExecutionPolicy Bypass -File {0}
@@ -92,13 +95,16 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $resultPath = Join-Path $env:GITHUB_WORKSPACE 'artifacts\unity\test-results\playmode.xml'
           $logPath = Join-Path $env:GITHUB_WORKSPACE 'artifacts\unity\logs\playmode.log'
-          & $env:UNITY_PATH -batchmode -nographics -quit -projectPath $env:GITHUB_WORKSPACE -runTests -testPlatform PlayMode -testResults $resultPath -logFile $logPath
+          & $env:UNITY_PATH -batchmode -nographics -projectPath $env:GITHUB_WORKSPACE -runTests -testPlatform PlayMode -testResults $resultPath -logFile $logPath
           $exitCode = $LASTEXITCODE
           if ($exitCode -ne 0) {
             if (Test-Path $logPath) { Get-Content $logPath | Select-Object -Last 160 }
             throw "PlayMode tests failed with exit code $exitCode."
           }
-          if (-not (Test-Path $resultPath)) { throw 'PlayMode result XML was not created.' }
+          if (-not (Test-Path $resultPath) -or (Get-Item $resultPath).Length -eq 0) {
+            if (Test-Path $logPath) { Get-Content $logPath | Select-Object -Last 160 }
+            throw 'PlayMode result XML was not created.'
+          }
 
       - name: Validate Unity test reports
         shell: powershell -ExecutionPolicy Bypass -File {0}
