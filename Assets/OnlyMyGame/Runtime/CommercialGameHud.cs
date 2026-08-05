@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using OnlyMyGame.Core;
+using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
 using RuleEventType = OnlyMyGame.Core.EventType;
@@ -35,12 +36,12 @@ namespace OnlyMyGame.Runtime
 
         private readonly Dictionary<CommandType, Button> actionButtons = new Dictionary<CommandType, Button>();
         private readonly List<Button> dynamicActionButtons = new List<Button>();
-        private readonly List<Text> dynamicActionLabels = new List<Text>();
+        private readonly List<TextMeshProUGUI> dynamicActionLabels = new List<TextMeshProUGUI>();
         private readonly List<DynamicActionV1> displayedDynamicActions = new List<DynamicActionV1>();
         private readonly Dictionary<BuildingType, Button> buildTypeButtons = new Dictionary<BuildingType, Button>();
-        private readonly Dictionary<BuildingType, Text> buildTypeLabels = new Dictionary<BuildingType, Text>();
+        private readonly Dictionary<BuildingType, TextMeshProUGUI> buildTypeLabels = new Dictionary<BuildingType, TextMeshProUGUI>();
         private GameController controller;
-        private Font font;
+        private TMP_FontAsset font;
         private GameObject interfaceRoot;
         private GameObject mainMenu;
         private GameObject pauseMenu;
@@ -48,28 +49,28 @@ namespace OnlyMyGame.Runtime
         private GameObject buildPickerPanel;
         private GameObject modalPanel;
         private GameObject outcomePanel;
-        private Text headline;
-        private Text luckBadge;
-        private Text resources;
-        private Text objective;
-        private Text relations;
-        private Text rules;
-        private Text journal;
-        private Text selectionTitle;
-        private Text selectionBody;
-        private Text selectionHint;
-        private Text dynamicActionSummary;
-        private Text queue;
-        private Text planningHint;
-        private Text service;
-        private Text endTurnLabel;
-        private Text toast;
-        private Text modalTitle;
-        private Text modalBody;
-        private Text outcomeTitle;
-        private Text outcomeBody;
-        private Text continueLabel;
-        private Text mainMenuStatus;
+        private TextMeshProUGUI headline;
+        private TextMeshProUGUI luckBadge;
+        private TextMeshProUGUI resources;
+        private TextMeshProUGUI objective;
+        private TextMeshProUGUI relations;
+        private TextMeshProUGUI rules;
+        private TextMeshProUGUI journal;
+        private TextMeshProUGUI selectionTitle;
+        private TextMeshProUGUI selectionBody;
+        private TextMeshProUGUI selectionHint;
+        private TextMeshProUGUI dynamicActionSummary;
+        private TextMeshProUGUI queue;
+        private TextMeshProUGUI planningHint;
+        private TextMeshProUGUI service;
+        private TextMeshProUGUI endTurnLabel;
+        private TextMeshProUGUI toast;
+        private TextMeshProUGUI modalTitle;
+        private TextMeshProUGUI modalBody;
+        private TextMeshProUGUI outcomeTitle;
+        private TextMeshProUGUI outcomeBody;
+        private TextMeshProUGUI continueLabel;
+        private TextMeshProUGUI mainMenuStatus;
         private Image spFill;
         private Button continueButton;
         private Button previousRunButton;
@@ -80,7 +81,7 @@ namespace OnlyMyGame.Runtime
         private Button modalSaveButton;
         private Button modalAcceptButton;
         private Button modalCancelButton;
-        private Text ledgerBody;
+        private TextMeshProUGUI ledgerBody;
         private GameObject toastPanel;
         private Action<DynamicActionV1> dynamicActionHandler;
         private ModalMode modalMode;
@@ -92,7 +93,11 @@ namespace OnlyMyGame.Runtime
             if (initialized) return;
             initialized = true;
             controller = gameController;
-            font = Resources.Load<Font>("Fonts/NanumGothic-Regular") ?? Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+            font = Resources.Load<TMP_FontAsset>("Fonts/NanumGothic-Regular SDF");
+            if (font == null)
+            {
+                throw new InvalidOperationException("NanumGothic TMP font asset is required for crisp WebGL UI text.");
+            }
 
             var canvas = GetComponent<Canvas>();
             if (canvas == null) canvas = gameObject.AddComponent<Canvas>();
@@ -178,7 +183,7 @@ namespace OnlyMyGame.Runtime
             Anchor(clearButton.gameObject, new Vector2(1, 1), new Vector2(1, 1), new Vector2(-136, -24), new Vector2(112, 40), new Vector2(1, 1));
             endTurnButton = ButtonObject("EndTurn", bottom.transform, "", new Color(0.11f, 0.55f, 0.68f, 1), controller.EndTurnFromHud);
             Anchor(endTurnButton.gameObject, new Vector2(1, 0), new Vector2(1, 0), new Vector2(-18, 18), new Vector2(246, 78), new Vector2(1, 0));
-            endTurnLabel = endTurnButton.GetComponentInChildren<Text>();
+            endTurnLabel = endTurnButton.GetComponentInChildren<TextMeshProUGUI>();
 
             var journalPanel = PanelObject("JournalStrip", interfaceRoot.transform, new Color(0.04f, 0.065f, 0.1f, 0.88f));
             Anchor(journalPanel, new Vector2(0, 0), new Vector2(0, 0), new Vector2(18, 18), new Vector2(420, 190), new Vector2(0, 0));
@@ -226,7 +231,7 @@ namespace OnlyMyGame.Runtime
                 var slot = i;
                 var button = ButtonObject("DynamicAction_" + i, parent, string.Empty, new Color(0.34f, 0.24f, 0.47f, 1), () => RequestDynamicAction(slot));
                 Anchor(button.gameObject, new Vector2(0, 1), new Vector2(1, 1), new Vector2(18, -454 - i * 52), new Vector2(-36, 44), new Vector2(0, 1));
-                var label = button.GetComponentInChildren<Text>();
+                var label = button.GetComponentInChildren<TextMeshProUGUI>();
                 label.fontSize = 13;
                 dynamicActionButtons.Add(button);
                 dynamicActionLabels.Add(label);
@@ -247,7 +252,7 @@ namespace OnlyMyGame.Runtime
             var pitch = Label("Pitch", card.transform, "절차 생성 핵사곤을 탐험하고 자원을 모아 살아남으세요.\n당신의 선택을 읽은 AI가 다음 턴의 규칙과 승리 조건을 만듭니다.", 16, Muted, TextAnchor.MiddleCenter, FontStyle.Normal);
             Anchor(pitch.gameObject, new Vector2(0, 1), new Vector2(1, 1), new Vector2(38, -205), new Vector2(-76, 80), new Vector2(0.5f, 1));
             continueButton = ButtonObject("Continue", card.transform, "원정 계속하기", new Color(0.1f, 0.55f, 0.68f, 1), controller.ContinueRun);
-            continueLabel = continueButton.GetComponentInChildren<Text>();
+            continueLabel = continueButton.GetComponentInChildren<TextMeshProUGUI>();
             Anchor(continueButton.gameObject, new Vector2(0.5f, 0), new Vector2(0.5f, 0), new Vector2(0, 206), new Vector2(320, 62), new Vector2(0.5f, 0));
             var fresh = ButtonObject("NewRun", card.transform, "새 원정 시작", new Color(0.35f, 0.42f, 0.2f, 1), controller.StartNewRun);
             Anchor(fresh.gameObject, new Vector2(0.5f, 0), new Vector2(0.5f, 0), new Vector2(0, 136), new Vector2(320, 58), new Vector2(0.5f, 0));
@@ -306,7 +311,7 @@ namespace OnlyMyGame.Runtime
             bodyRect.anchoredPosition = Vector2.zero;
             bodyRect.sizeDelta = Vector2.zero;
             bodyRect.localScale = Vector3.one;
-            ledgerBody.verticalOverflow = VerticalWrapMode.Overflow;
+            ledgerBody.overflowMode = TextOverflowModes.Overflow;
             var fitter = ledgerBody.gameObject.AddComponent<ContentSizeFitter>();
             fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
             var scrollRect = scroll.AddComponent<ScrollRect>();
@@ -339,11 +344,11 @@ namespace OnlyMyGame.Runtime
                 var row = index / 2;
                 var button = ButtonObject("BuildType_" + type, card.transform, string.Empty, new Color(0.16f, 0.26f, 0.34f, 1), () => SelectBuildType(selectedType));
                 Anchor(button.gameObject, new Vector2(0, 1), new Vector2(0, 1), new Vector2(42 + column * 374, -142 - row * 126), new Vector2(362, 108), new Vector2(0, 1));
-                var label = button.GetComponentInChildren<Text>();
+                var label = button.GetComponentInChildren<TextMeshProUGUI>();
                 label.fontSize = 16;
-                label.resizeTextForBestFit = true;
-                label.resizeTextMinSize = 12;
-                label.resizeTextMaxSize = 16;
+                label.enableAutoSizing = true;
+                label.fontSizeMin = 12;
+                label.fontSizeMax = 16;
                 buildTypeButtons[type] = button;
                 buildTypeLabels[type] = label;
             }
@@ -362,9 +367,9 @@ namespace OnlyMyGame.Runtime
             modalTitle = Label("ModalTitle", card.transform, "", 30, Gold, TextAnchor.MiddleCenter, FontStyle.Bold);
             Anchor(modalTitle.gameObject, new Vector2(0, 1), new Vector2(1, 1), new Vector2(28, -34), new Vector2(-56, 50), new Vector2(0.5f, 1));
             modalBody = Label("ModalBody", card.transform, "", 17, Color.white, TextAnchor.UpperLeft, FontStyle.Normal);
-            modalBody.resizeTextForBestFit = true;
-            modalBody.resizeTextMinSize = 13;
-            modalBody.resizeTextMaxSize = 17;
+            modalBody.enableAutoSizing = true;
+            modalBody.fontSizeMin = 13;
+            modalBody.fontSizeMax = 17;
             Anchor(modalBody.gameObject, Vector2.zero, Vector2.one, new Vector2(42, 100), new Vector2(-84, -200), new Vector2(0, 0));
             modalRetryButton = ButtonObject("Retry", card.transform, "AI 규칙 다시 요청", new Color(0.55f, 0.27f, 0.2f, 1), controller.RetryRulesFromHud);
             Anchor(modalRetryButton.gameObject, new Vector2(0.5f, 0), new Vector2(0.5f, 0), new Vector2(-130, 28), new Vector2(240, 54), new Vector2(0.5f, 0));
@@ -387,9 +392,9 @@ namespace OnlyMyGame.Runtime
             outcomeTitle = Label("OutcomeTitle", card.transform, string.Empty, 42, Gold, TextAnchor.MiddleCenter, FontStyle.Bold);
             Anchor(outcomeTitle.gameObject, new Vector2(0, 1), new Vector2(1, 1), new Vector2(30, -54), new Vector2(-60, 64), new Vector2(0.5f, 1));
             outcomeBody = Label("OutcomeBody", card.transform, string.Empty, 18, Color.white, TextAnchor.MiddleCenter, FontStyle.Normal);
-            outcomeBody.resizeTextForBestFit = true;
-            outcomeBody.resizeTextMinSize = 15;
-            outcomeBody.resizeTextMaxSize = 18;
+            outcomeBody.enableAutoSizing = true;
+            outcomeBody.fontSizeMin = 15;
+            outcomeBody.fontSizeMax = 18;
             Anchor(outcomeBody.gameObject, new Vector2(0, 0), new Vector2(1, 1), new Vector2(46, 112), new Vector2(-92, -242), new Vector2(0.5f, 0.5f));
             var again = ButtonObject("Again", card.transform, "새 원정 시작", new Color(0.1f, 0.55f, 0.68f, 1), controller.StartNewRun);
             Anchor(again.gameObject, new Vector2(0.5f, 0), new Vector2(0.5f, 0), new Vector2(-140, 32), new Vector2(250, 58), new Vector2(0.5f, 0));
@@ -609,7 +614,7 @@ namespace OnlyMyGame.Runtime
             {
                 var delay = controller.RetryDelaySeconds;
                 modalRetryButton.interactable = delay <= 0;
-                var label = modalRetryButton.GetComponentInChildren<Text>();
+                var label = modalRetryButton.GetComponentInChildren<TextMeshProUGUI>();
                 if (label != null) label.text = delay > 0 ? "다시 요청  (" + delay + "초)" : "AI 규칙 다시 요청";
             }
             if (Input.GetKeyDown(KeyCode.Tab))
@@ -831,7 +836,7 @@ namespace OnlyMyGame.Runtime
             if (modalAcceptButton != null)
             {
                 modalAcceptButton.gameObject.SetActive(mode == ModalMode.RuleAnnouncement || mode == ModalMode.NewRunConfirmation);
-                var label = modalAcceptButton.GetComponentInChildren<Text>();
+                var label = modalAcceptButton.GetComponentInChildren<TextMeshProUGUI>();
                 if (label != null) label.text = mode == ModalMode.NewRunConfirmation ? "새 원정 시작" : "규칙을 확인했습니다";
                 var rect = modalAcceptButton.GetComponent<RectTransform>();
                 if (rect != null) rect.anchoredPosition = mode == ModalMode.NewRunConfirmation ? new Vector2(-140, 28) : new Vector2(0, 28);
@@ -1168,21 +1173,38 @@ namespace OnlyMyGame.Runtime
             return go;
         }
 
-        private Text Label(string name, Transform parent, string value, int size, Color color, TextAnchor alignment, FontStyle style)
+        private TextMeshProUGUI Label(string name, Transform parent, string value, int size, Color color, TextAnchor alignment, FontStyle style)
         {
             var go = CreateObject(name, parent);
-            var text = go.AddComponent<Text>();
+            var text = go.AddComponent<TextMeshProUGUI>();
             text.font = font;
             text.fontSize = size;
-            text.fontStyle = style;
+            text.fontStyle = style == FontStyle.Bold ? FontStyles.Bold : FontStyles.Normal;
             text.color = color;
-            text.alignment = alignment;
+            text.alignment = ToTextAlignment(alignment);
             text.text = value;
-            text.supportRichText = true;
-            text.horizontalOverflow = HorizontalWrapMode.Wrap;
-            text.verticalOverflow = VerticalWrapMode.Truncate;
+            text.richText = true;
+            text.enableWordWrapping = true;
+            text.overflowMode = TextOverflowModes.Truncate;
             text.raycastTarget = false;
             return text;
+        }
+
+        private static TextAlignmentOptions ToTextAlignment(TextAnchor alignment)
+        {
+            switch (alignment)
+            {
+                case TextAnchor.UpperLeft: return TextAlignmentOptions.TopLeft;
+                case TextAnchor.UpperCenter: return TextAlignmentOptions.Top;
+                case TextAnchor.UpperRight: return TextAlignmentOptions.TopRight;
+                case TextAnchor.MiddleLeft: return TextAlignmentOptions.MidlineLeft;
+                case TextAnchor.MiddleCenter: return TextAlignmentOptions.Center;
+                case TextAnchor.MiddleRight: return TextAlignmentOptions.MidlineRight;
+                case TextAnchor.LowerLeft: return TextAlignmentOptions.BottomLeft;
+                case TextAnchor.LowerCenter: return TextAlignmentOptions.Bottom;
+                case TextAnchor.LowerRight: return TextAlignmentOptions.BottomRight;
+                default: return TextAlignmentOptions.TopLeft;
+            }
         }
 
         private Button ButtonObject(string name, Transform parent, string label, Color color, Action callback)
